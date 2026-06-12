@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <title>{{ subject }}</title>
+  <style type="text/css">
+    /* ── Reset ── */
+    body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
+    table, td { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+    img { -ms-interpolation-mode: bicubic; border: 0; height: auto; line-height: 100%; outline: none; text-decoration: none; }
+    body { height: 100% !important; margin: 0 !important; padding: 0 !important; width: 100% !important; }
+
+    /* ── Mobile ── */
+    @media screen and (max-width: 600px) {
+      .email-container { width: 100% !important; }
+      .fluid { max-width: 100% !important; height: auto !important; }
+      .stack-column, .stack-column-center { display: block !important; width: 100% !important; max-width: 100% !important; direction: ltr !important; }
+      .stack-column-center { text-align: center !important; }
+      .center-on-narrow { text-align: center !important; display: block !important; margin-left: auto !important; margin-right: auto !important; float: none !important; }
+      .bill-card-inner { padding: 16px !important; }
+      .hero-padding { padding: 30px 20px !important; }
+      .section-padding { padding: 20px !important; }
+      .tag { display: inline-block; }
+    }
+  </style>
+</head>
+<body style="margin:0; padding:0; background-color:#0d0d0d; font-family:'Segoe UI', Arial, sans-serif;">
+
+  <!-- ── Preheader ── -->
+  <div style="display:none; max-height:0; overflow:hidden;">
+    {{ preheader_text }}
+    &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;
+  </div>
+
+  <!-- ── Outer Wrapper ── -->
+  <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color:#0d0d0d;">
+    <tr>
+      <td align="center" style="padding: 20px 10px;">
+
+        <!-- ── Email Container ── -->
+        <table role="presentation" class="email-container" cellspacing="0" cellpadding="0" border="0" width="600" style="max-width:600px; background-color:#111111; border:1px solid #27272a; border-radius:16px; overflow:hidden;">
+
+          <!-- ━━━━━━━━━━━━━━ HEADER ━━━━━━━━━━━━━━ -->
+          <tr>
+            <td style="background: linear-gradient(135deg, #004d4a 0%, #006C67 100%); padding: 36px 40px;" class="hero-padding">
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                <tr>
+                  <td>
+                    <p style="margin:0 0 6px 0; font-size:12px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:#7fffd4; font-family:monospace;">
+                      ⚖️ ALDF LEGISLATIVE TRACKER
+                    </p>
+                    <h1 style="margin:0 0 8px 0; font-size:26px; font-weight:700; color:#ffffff; line-height:1.2;">
+                      {{ digest_title }}
+                    </h1>
+                    <p style="margin:0; font-size:14px; color:#a8f0e8;">
+                      {{ period_label }} &nbsp;·&nbsp; {{ digest_metadata.generated_at[:10] }}
+                    </p>
+                  </td>
+                  <td align="right" valign="top" style="padding-left:20px;">
+                    <div style="background:rgba(255,255,255,0.1); border-radius:12px; padding:12px 16px; text-align:center; min-width:60px;">
+                      <p style="margin:0; font-size:28px; font-weight:700; color:#ffffff;">{{ items|length }}</p>
+                      <p style="margin:2px 0 0; font-size:10px; color:#a8f0e8; text-transform:uppercase; letter-spacing:1px;">Bills</p>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- ━━━━━━━━━━━━━━ INTRO / SUMMARY ━━━━━━━━━━━━━━ -->
+          <tr>
+            <td style="padding: 28px 40px 20px;" class="section-padding">
+              <p style="margin:0 0 12px; font-size:15px; color:#a1a1aa; line-height:1.6;">
+                Hi <strong style="color:#e4e4e7;">{{ recipient.email }}</strong>,
+              </p>
+              {% if items %}
+              <p style="margin:0; font-size:15px; color:#a1a1aa; line-height:1.6;">
+                Here are <strong style="color:#e4e4e7;">{{ items|length }} legislative update{% if items|length != 1 %}s{% endif %}</strong>
+                matching your tracking preferences during the {{ period_label|lower }}.
+                {% if overall_summary %}
+                {{ overall_summary }}
+                {% endif %}
+              </p>
+              {% else %}
+              <!-- ━━ EMPTY STATE ━━ -->
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                     style="border:1px solid #27272a; border-radius:12px; background-color:#1a1a1a;">
+                <tr>
+                  <td style="padding:32px; text-align:center;">
+                    <p style="margin:0 0 8px; font-size:28px;">🔍</p>
+                    <p style="margin:0 0 12px; font-size:16px; font-weight:600; color:#e4e4e7;">No updates this {{ period_label|lower }}</p>
+                    <p style="margin:0 0 20px; font-size:14px; color:#71717a; line-height:1.6;">
+                      No legislative updates matching your interests were found during this period.
+                      You can review the most recent activity in your dashboard.
+                    </p>
+                    <a href="{{ frontend_url }}?tab=recent"
+                       style="display:inline-block; background:#006C67; color:#ffffff; text-decoration:none;
+                              padding:12px 28px; border-radius:8px; font-weight:600; font-size:14px;">
+                      View Recent Changes →
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              {% endif %}
+            </td>
+          </tr>
+
+          {% if items %}
+          <!-- ━━━━━━━━━━━━━━ DIGEST SUMMARY STRIP ━━━━━━━━━━━━━━ -->
+          <tr>
+            <td style="padding: 0 40px 24px;" class="section-padding">
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                     style="border:1px solid #27272a; border-radius:10px; background-color:#161616; overflow:hidden;">
+                <tr>
+                  <td style="padding:16px 20px; border-right:1px solid #27272a; text-align:center; width:33%;">
+                    <p style="margin:0; font-size:20px; font-weight:700; color:#7fffd4;">{{ items|length }}</p>
+                    <p style="margin:4px 0 0; font-size:11px; color:#71717a; text-transform:uppercase; letter-spacing:1px;">Total Bills</p>
+                  </td>
+                  <td style="padding:16px 20px; border-right:1px solid #27272a; text-align:center; width:33%;">
+                    <p style="margin:0; font-size:20px; font-weight:700; color:#7fffd4;">
+                      {{ items|selectattr('is_review_bill')|list|length }}
+                    </p>
+                    <p style="margin:4px 0 0; font-size:11px; color:#71717a; text-transform:uppercase; letter-spacing:1px;">Watched Bills</p>
+                  </td>
+                  <td style="padding:16px 20px; text-align:center; width:33%;">
+                    <p style="margin:0; font-size:20px; font-weight:700; color:#7fffd4;">
+                      {% if items %}{{ (items|sum(attribute='relevance_score') / items|length)|round|int }}{% else %}0{% endif %}
+                    </p>
+                    <p style="margin:4px 0 0; font-size:11px; color:#71717a; text-transform:uppercase; letter-spacing:1px;">Avg AI Score</p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+
+          <!-- ━━━━━━━━━━━━━━ BILL CARDS ━━━━━━━━━━━━━━ -->
+          <tr>
+            <td style="padding: 0 40px;" class="section-padding">
+              <p style="margin:0 0 16px; font-size:11px; font-weight:700; color:#71717a; text-transform:uppercase; letter-spacing:2px; font-family:monospace;">
+                📋 LEGISLATIVE UPDATES
+              </p>
+            </td>
+          </tr>
+
+          {% for item in items %}
+          <tr>
+            <td style="padding: 0 40px {% if not loop.last %}16px{% else %}24px{% endif %};" class="section-padding">
+
+              <!-- Bill Card -->
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                     style="border:1px solid {% if item.is_review_bill %}#4d7c0f{% else %}#27272a{% endif %};
+                            border-radius:12px; background-color:#161616; overflow:hidden;">
+
+                <!-- Card Top Bar -->
+                <tr>
+                  <td style="background: {% if item.is_review_bill %}rgba(77,124,15,0.15){% else %}rgba(0,108,103,0.1){% endif %};
+                              padding:12px 20px; border-bottom:1px solid #27272a;">
+                    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                      <tr>
+                        <td>
+                          <!-- Document ID + Tags -->
+                          <span style="display:inline-block; font-family:monospace; font-size:13px; font-weight:700;
+                                       color:#7fffd4; margin-right:8px;">
+                            {{ item.document_id }}
+                          </span>
+                          {% if item.is_review_bill %}
+                          <span style="display:inline-block; background:#4d7c0f; color:#ecfccb; font-size:10px;
+                                       font-weight:700; padding:2px 8px; border-radius:4px; text-transform:uppercase;
+                                       letter-spacing:1px; vertical-align:middle;">
+                            Watched
+                          </span>
+                          {% endif %}
+                        </td>
+                        <td align="right">
+                          <!-- AI Score Badge -->
+                          {% if item.relevance_score is not none %}
+                          <span style="display:inline-block; font-family:monospace; font-size:12px; font-weight:700;
+                                       color:{% if item.relevance_score >= 70 %}#7fffd4{% elif item.relevance_score >= 40 %}#fbbf24{% else %}#f87171{% endif %};
+                                       padding:2px 8px; border:1px solid {% if item.relevance_score >= 70 %}#006C67{% elif item.relevance_score >= 40 %}#78350f{% else %}#7f1d1d{% endif %};
+                                       border-radius:6px;">
+                            AI {{ item.relevance_score }}
+                          </span>
+                          {% endif %}
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+
+                <!-- Card Body -->
+                <tr>
+                  <td class="bill-card-inner" style="padding:20px;">
+
+                    <!-- Title -->
+                    <h2 style="margin:0 0 8px; font-size:16px; font-weight:600; color:#e4e4e7; line-height:1.4;">
+                      {{ item.title }}
+                    </h2>
+
+                    <!-- Policy Area Tag -->
+                    <p style="margin:0 0 16px;">
+                      <span style="display:inline-block; background:#1f2937; color:#9ca3af; font-size:11px;
+                                   padding:3px 10px; border-radius:20px; font-family:monospace;">
+                        {{ item.policy_area }}
+                      </span>
+                    </p>
+
+                    <!-- ── Match Rationale ── -->
+                    {% if item.match_reason and item.match_reason.explanation %}
+                    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                           style="background:rgba(0,108,103,0.08); border-left:3px solid #006C67;
+                                  border-radius:0 6px 6px 0; margin-bottom:16px;">
+                      <tr>
+                        <td style="padding:10px 14px;">
+                          <p style="margin:0 0 4px; font-size:10px; font-weight:700; color:#7fffd4;
+                                    text-transform:uppercase; letter-spacing:1px; font-family:monospace;">
+                            Why this matched
+                          </p>
+                          <p style="margin:0; font-size:13px; color:#a8f0e8; line-height:1.5;">
+                            {{ item.match_reason.explanation }}
+                          </p>
+                          {% if item.match_reason.matched_topics %}
+                          <p style="margin:6px 0 0;">
+                            {% for topic in item.match_reason.matched_topics[:4] %}
+                            <span style="display:inline-block; background:#004d4a; color:#7fffd4; font-size:10px;
+                                         padding:2px 7px; border-radius:3px; margin:2px 3px 2px 0; font-family:monospace;">
+                              {{ topic }}
+                            </span>
+                            {% endfor %}
+                          </p>
+                          {% endif %}
+                        </td>
+                      </tr>
+                    </table>
+                    {% endif %}
+
+                    <!-- ── AI Summary ── -->
+                    {% if item.ai_summary and item.ai_summary != '(no AI summary available)' %}
+                    <p style="margin:0 0 6px; font-size:10px; font-weight:700; color:#71717a;
+                               text-transform:uppercase; letter-spacing:1px; font-family:monospace;">
+                      AI Summary
+                    </p>
+                    <p style="margin:0 0 16px; font-size:13px; color:#a1a1aa; line-height:1.6;">
+                      {{ item.ai_summary[:400] }}{% if item.ai_summary|length > 400 %}…{% endif %}
+                    </p>
+                    {% endif %}
+
+                    <!-- ── Latest Action ── -->
+                    {% if item.last_action %}
+                    <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                           style="background:#1a1a1a; border:1px solid #27272a; border-radius:8px; margin-bottom:18px;">
+                      <tr>
+                        <td style="padding:12px 14px;">
+                          <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
+                            <tr>
+                              <td>
+                                <p style="margin:0 0 2px; font-size:10px; font-weight:700; color:#71717a;
+                                           text-transform:uppercase; letter-spacing:1px; font-family:monospace;">
+                                  Latest Action
+                                </p>
+                              </td>
+                              <td align="right">
+                                <p style="margin:0; font-size:11px; color:#52525b; font-family:monospace;">
+                                  {{ item.last_action.action_date }}
+                                </p>
+                              </td>
+                            </tr>
+                          </table>
+                          <p style="margin:6px 0 0; font-size:13px; color:#d4d4d8; line-height:1.5;">
+                            {{ item.last_action.text }}
+                          </p>
+                        </td>
+                      </tr>
+                    </table>
+                    {% endif %}
+
+                    <!-- ── CTA Buttons ── -->
+                    <table role="presentation" cellspacing="0" cellpadding="0" border="0">
+                      <tr>
+                        <td style="padding-right:10px;">
+                          <a href="{{ item.app_detail_url }}"
+                             style="display:inline-block; background:#006C67; color:#ffffff; text-decoration:none;
+                                    padding:10px 20px; border-radius:8px; font-weight:600; font-size:13px;">
+                            View in Dashboard →
+                          </a>
+                        </td>
+                        <td>
+                          <a href="{{ item.external_source_url }}"
+                             style="display:inline-block; background:transparent; color:#7fffd4; text-decoration:none;
+                                    padding:10px 20px; border-radius:8px; font-weight:600; font-size:13px;
+                                    border:1px solid #27272a;">
+                            Congress.gov ↗
+                          </a>
+                        </td>
+                      </tr>
+                    </table>
+
+                  </td>
+                </tr>
+              </table>
+              <!-- End Bill Card -->
+
+            </td>
+          </tr>
+          {% endfor %}
+          {% endif %}
+
+          <!-- ━━━━━━━━━━━━━━ FOOTER ━━━━━━━━━━━━━━ -->
+          <tr>
+            <td style="padding: 28px 40px; border-top:1px solid #1f1f1f; text-align:center;" class="section-padding">
+              <p style="margin:0 0 8px; font-size:12px; color:#52525b;">
+                Animal Legal Defense Fund — Legislative Tracking System
+              </p>
+              <p style="margin:0; font-size:11px; color:#3f3f46;">
+                You are receiving this because your account is set to
+                <strong style="color:#52525b;">{{ recipient.frequency }}</strong> digests.
+                &nbsp;·&nbsp;
+                <a href="{{ frontend_url }}?tab=prefs" style="color:#71717a; text-decoration:underline;">
+                  Manage Preferences
+                </a>
+              </p>
+              <p style="margin:12px 0 0; font-size:10px; color:#3f3f46; font-family:monospace;">
+                {{ digest_metadata.generated_at[:10] }} &nbsp;·&nbsp;
+                Window: {{ digest_metadata.time_window_start[:10] }} → {{ digest_metadata.time_window_end[:10] }}
+              </p>
+            </td>
+          </tr>
+
+        </table>
+        <!-- End Email Container -->
+
+      </td>
+    </tr>
+  </table>
+
+</body>
+</html>
