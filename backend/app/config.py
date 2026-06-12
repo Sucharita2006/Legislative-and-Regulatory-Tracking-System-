@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_FROM: str = ""
 
+    # Backend public URL (used in verification email links — must be the Railway URL in production)
+    BACKEND_URL: str = "http://localhost:8000"
+
+    # Email Digest pipeline configuration
+    DIGEST_MAX_ITEMS: int = 10
+    DIGEST_WINDOW_DAILY_HOURS: int = 24
+    DIGEST_WINDOW_WEEKLY_DAYS: int = 7
+
     # Frontend base URL (used in verification email links)
     FRONTEND_URL: str = "http://localhost:5173"
 
