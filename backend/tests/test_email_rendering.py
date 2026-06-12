@@ -176,6 +176,50 @@ class TestRenderDigestHtml:
         # "Watched" badge is a styled span inside the card top bar — check it's not in a badge context
         assert 'letter-spacing:1px;">\n                            Watched' not in html
 
+    def test_matched_keywords_rendered(self):
+        """Matched keywords should appear as styled pills in the match rationale block."""
+        items = [{
+            **_make_payload()["items"][0],
+            "match_reason": {
+                "matched_topics": [],
+                "matched_keywords": ["animal testing", "lab standards"],
+                "explanation": "Matches search keywords: animal testing, lab standards",
+            }
+        }]
+        html = render_digest_html(_make_payload(items=items))
+        assert "animal testing" in html
+        assert "lab standards" in html
+
+    def test_both_topics_and_keywords_rendered(self):
+        """Both matched_topics and matched_keywords should appear when present."""
+        items = [{
+            **_make_payload()["items"][0],
+            "match_reason": {
+                "matched_topics": ["farm animal welfare"],
+                "matched_keywords": ["livestock"],
+                "explanation": "Matched topics and keywords",
+            }
+        }]
+        html = render_digest_html(_make_payload(items=items))
+        assert "farm animal welfare" in html
+        assert "livestock" in html
+
+    def test_outlook_gradient_fallback_present(self):
+        """Header td must have background-color fallback for Outlook."""
+        html = render_digest_html(_make_payload())
+        assert "background-color:#006C67" in html
+
+    def test_cta_primary_button_outlook_safe(self):
+        """Primary CTA must use explicit background-color (not just shorthand) for Outlook."""
+        html = render_digest_html(_make_payload())
+        assert "background-color:#006C67" in html
+
+    def test_cta_ghost_button_not_transparent(self):
+        """Ghost CTA button must use explicit background-color instead of transparent for Outlook."""
+        html = render_digest_html(_make_payload())
+        assert "background-color:#1a1a1a" in html
+        assert "background:transparent" not in html
+
     def test_overall_summary_appears(self):
         html = render_digest_html(_make_payload())
         assert "Test overall summary." in html

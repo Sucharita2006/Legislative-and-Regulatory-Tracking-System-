@@ -23,6 +23,13 @@
       .hero-padding { padding: 30px 20px !important; }
       .section-padding { padding: 20px !important; }
       .tag { display: inline-block; }
+      /* Header: stack title and badge vertically on narrow screens */
+      .header-title-cell { display: block !important; width: 100% !important; }
+      .header-badge-cell { display: block !important; width: 100% !important; padding-left: 0 !important; padding-top: 14px !important; text-align: left !important; }
+      /* CTA buttons: stack vertically on mobile */
+      .cta-row { display: block !important; }
+      .cta-btn-cell { display: block !important; padding-right: 0 !important; padding-bottom: 10px !important; width: 100% !important; }
+      .cta-btn-cell a { display: block !important; text-align: center !important; }
     }
   </style>
 </head>
@@ -44,22 +51,22 @@
 
           <!-- ━━━━━━━━━━━━━━ HEADER ━━━━━━━━━━━━━━ -->
           <tr>
-            <td style="background: linear-gradient(135deg, #004d4a 0%, #006C67 100%); padding: 36px 40px;" class="hero-padding">
+            <td style="background-color:#006C67; background: linear-gradient(135deg, #004d4a 0%, #006C67 100%); padding: 36px 40px;" class="hero-padding">
               <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
                 <tr>
-                  <td>
+                  <td class="header-title-cell">
                     <p style="margin:0 0 6px 0; font-size:12px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color:#7fffd4; font-family:monospace;">
-                      ⚖️ ALDF LEGISLATIVE TRACKER
+                      &#x2696;&#xFE0F; ALDF LEGISLATIVE TRACKER
                     </p>
                     <h1 style="margin:0 0 8px 0; font-size:26px; font-weight:700; color:#ffffff; line-height:1.2;">
                       {{ digest_title }}
                     </h1>
                     <p style="margin:0; font-size:14px; color:#a8f0e8;">
-                      {{ period_label }} &nbsp;·&nbsp; {{ digest_metadata.generated_at[:10] }}
+                      {{ period_label }} &nbsp;&middot;&nbsp; {{ digest_metadata.generated_at[:10] }}
                     </p>
                   </td>
-                  <td align="right" valign="top" style="padding-left:20px;">
-                    <div style="background:rgba(255,255,255,0.1); border-radius:12px; padding:12px 16px; text-align:center; min-width:60px;">
+                  <td align="right" valign="top" style="padding-left:20px; white-space:nowrap;" class="header-badge-cell">
+                    <div style="background:rgba(255,255,255,0.15); background-color:#005a56; border-radius:10px; padding:12px 16px; text-align:center; min-width:56px; display:inline-block;">
                       <p style="margin:0; font-size:28px; font-weight:700; color:#ffffff;">{{ items|length }}</p>
                       <p style="margin:2px 0 0; font-size:10px; color:#a8f0e8; text-transform:uppercase; letter-spacing:1px;">Bills</p>
                     </div>
@@ -220,12 +227,19 @@
                           <p style="margin:0; font-size:13px; color:#a8f0e8; line-height:1.5;">
                             {{ item.match_reason.explanation }}
                           </p>
-                          {% if item.match_reason.matched_topics %}
+                          {% if item.match_reason.matched_topics or item.match_reason.matched_keywords %}
                           <p style="margin:6px 0 0;">
                             {% for topic in item.match_reason.matched_topics[:4] %}
                             <span style="display:inline-block; background:#004d4a; color:#7fffd4; font-size:10px;
                                          padding:2px 7px; border-radius:3px; margin:2px 3px 2px 0; font-family:monospace;">
                               {{ topic }}
+                            </span>
+                            {% endfor %}
+                            {% for kw in item.match_reason.matched_keywords[:4] %}
+                            <span style="display:inline-block; background:#1c1917; color:#a8a29e; font-size:10px;
+                                         padding:2px 7px; border-radius:3px; margin:2px 3px 2px 0; font-family:monospace;
+                                         border:1px solid #44403c;">
+                              {{ kw }}
                             </span>
                             {% endfor %}
                           </p>
@@ -276,21 +290,22 @@
                     {% endif %}
 
                     <!-- ── CTA Buttons ── -->
-                    <table role="presentation" cellspacing="0" cellpadding="0" border="0">
-                      <tr>
-                        <td style="padding-right:10px;">
+                    <table role="presentation" cellspacing="0" cellpadding="0" border="0" class="cta-row">
+                      <tr class="cta-row">
+                        <td style="padding-right:10px;" class="cta-btn-cell">
                           <a href="{{ item.app_detail_url }}"
-                             style="display:inline-block; background:#006C67; color:#ffffff; text-decoration:none;
-                                    padding:10px 20px; border-radius:8px; font-weight:600; font-size:13px;">
-                            View in Dashboard →
+                             style="display:inline-block; background-color:#006C67; background:#006C67; color:#ffffff; text-decoration:none;
+                                    padding:12px 22px; border-radius:6px; font-weight:600; font-size:13px;
+                                    mso-padding-alt:12px 22px; line-height:1;">
+                            View in Dashboard &rarr;
                           </a>
                         </td>
-                        <td>
+                        <td class="cta-btn-cell">
                           <a href="{{ item.external_source_url }}"
-                             style="display:inline-block; background:transparent; color:#7fffd4; text-decoration:none;
-                                    padding:10px 20px; border-radius:8px; font-weight:600; font-size:13px;
-                                    border:1px solid #27272a;">
-                            Congress.gov ↗
+                             style="display:inline-block; background-color:#1a1a1a; background:#1a1a1a; color:#7fffd4; text-decoration:none;
+                                    padding:12px 22px; border-radius:6px; font-weight:600; font-size:13px;
+                                    border:1px solid #3f3f46; mso-padding-alt:12px 22px; line-height:1;">
+                            Congress.gov &#x2197;
                           </a>
                         </td>
                       </tr>
