@@ -143,15 +143,25 @@
           </tr>
 
           <!-- ━━━━━━━━━━━━━━ BILL CARDS ━━━━━━━━━━━━━━ -->
+          {% for group in prompt_groups %}
           <tr>
-            <td style="padding: 0 40px;" class="section-padding">
-              <p style="margin:0 0 16px; font-size:11px; font-weight:700; color:#71717a; text-transform:uppercase; letter-spacing:2px; font-family:monospace;">
-                📋 LEGISLATIVE UPDATES
-              </p>
+            <td style="padding: 16px 40px 12px;" class="section-padding">
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="border-bottom: 2px solid #27272a; padding-bottom: 8px;">
+                <tr>
+                  <td>
+                    <h3 style="margin:0; font-size:14px; font-weight:700; color:#7fffd4; letter-spacing:1px; text-transform:uppercase; font-family:monospace; display:inline-block; vertical-align:middle;">
+                      🎯 {{ group.prompt_text }}
+                    </h3>
+                  </td>
+                  <td align="right" style="color:#71717a; font-size:11px; font-family:monospace; font-weight:700;">
+                    {{ group['items']|length }} {{ 'BILL' if group['items']|length == 1 else 'BILLS' }}
+                  </td>
+                </tr>
+              </table>
             </td>
           </tr>
 
-          {% for item in items %}
+          {% for item in group['items'] %}
           <tr>
             <td style="padding: 0 40px {% if not loop.last %}16px{% else %}24px{% endif %};" class="section-padding">
 
@@ -318,6 +328,7 @@
 
             </td>
           </tr>
+          {% endfor %}
           {% endfor %}
           {% endif %}
 

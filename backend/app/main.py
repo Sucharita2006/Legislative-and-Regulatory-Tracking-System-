@@ -15,7 +15,7 @@ import json
 from datetime import date
 
 from .database import get_db
-from .models import LegislativeDocument, SyncLog, Base, Subject, UserProfile
+from .models import LegislativeDocument, SyncLog, Base, Subject, UserProfile, UserPrompt
 from .services.sync import seed_animal_subjects, run_historical_backfill
 from .services.matching import get_current_stage, SUBJECT_CATEGORIES
 from .services.ai_processing import process_bill_ai, expand_prompt_to_topics, score_against_prompt
@@ -621,6 +621,40 @@ def trigger_daily_sync(background_tasks: BackgroundTasks):
     return {"message": "Daily sync started in background."}
 
 
+async def _bg_send_digests(frequency: str):
+    from .services.digest_service import compile_digests
+    from .services.email_render_service import render_digest_html
+    from .services.email_delivery_service import send_html_email
+    
+    db = SessionLocal()
+    try:
+        payloads = compile_digests(db, frequency)
+        for payload in payloads:
+            recipient_email = payload["recipient"]["email"]
+            try:
+                html_content = render_digest_html(payload)
+                subject = f"ALDF {frequency.capitalize()} Digest — {payload['digest_metadata']['generated_at'][:10]}"
+                await send_html_email(recipient_email, subject, html_content)
+            except Exception as e:
+                print(f"Error sending {frequency} digest to {recipient_email}: {e}")
+    finally:
+        db.close()
+
+
+@app.post("/digest/send/daily")
+def trigger_daily_digest(background_tasks: BackgroundTasks):
+    """Trigger compiling and sending daily digest emails to all verified users with daily prompts."""
+    background_tasks.add_task(_bg_send_digests, "daily")
+    return {"message": "Daily digest email sending started in background."}
+
+
+@app.post("/digest/send/weekly")
+def trigger_weekly_digest(background_tasks: BackgroundTasks):
+    """Trigger compiling and sending weekly digest emails to all verified users with weekly prompts."""
+    background_tasks.add_task(_bg_send_digests, "weekly")
+    return {"message": "Weekly digest email sending started in background."}
+
+
 @app.post("/ai/backfill")
 def trigger_ai_backfill(background_tasks: BackgroundTasks, force: bool = False):
     """Trigger AI processing for all stored bills that are missing AI output.
@@ -712,25 +746,46 @@ def create_user(body: Dict[str, Any], db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="email is required")
 
     profile = db.query(UserProfile).filter(UserProfile.email == email).first()
-    prompt = body.get("prompt")
+    prompt_text = body.get("prompt")
 
     if profile:
-        # If prompt changed, clear the cached expansion so it gets re-expanded
-        if prompt is not None and prompt != profile.prompt:
-            profile.expanded_topics = None
-        profile.prompt = prompt if prompt is not None else profile.prompt
-        profile.frequency = body.get("frequency", profile.frequency)
         profile.scope = body.get("scope", profile.scope)
-        profile.min_relevance_score = body.get("min_relevance_score", profile.min_relevance_score)
     else:
         profile = UserProfile(
             email=email,
-            prompt=prompt,
-            frequency=body.get("frequency", "daily"),
             scope=body.get("scope", "federal"),
-            min_relevance_score=body.get("min_relevance_score", 70),
         )
         db.add(profile)
+        db.flush()
+
+    if prompt_text is not None:
+        prompt_text = prompt_text.strip()
+        frequency = body.get("frequency", "daily")
+        
+        # Check if the user already has a prompt
+        existing_prompt = db.query(UserPrompt).filter(UserPrompt.user_id == profile.id).first()
+        if existing_prompt:
+            if prompt_text != existing_prompt.prompt_text:
+                existing_prompt.prompt_text = prompt_text
+                try:
+                    existing_prompt.expanded_topics = expand_prompt_to_topics(prompt_text, db=db, user_email=email)
+                except Exception as e:
+                    existing_prompt.expanded_topics = None
+            existing_prompt.frequency = frequency
+        else:
+            expansion = None
+            if prompt_text:
+                try:
+                    expansion = expand_prompt_to_topics(prompt_text, db=db, user_email=email)
+                except Exception as e:
+                    pass
+            new_prompt = UserPrompt(
+                user_id=profile.id,
+                prompt_text=prompt_text,
+                frequency=frequency,
+                expanded_topics=expansion,
+            )
+            db.add(new_prompt)
 
     db.commit()
     db.refresh(profile)
@@ -758,17 +813,8 @@ def update_user(email: str, body: Dict[str, Any], db: Session = Depends(get_db))
     if not profile:
         raise HTTPException(status_code=404, detail="User not found")
 
-    prompt = body.get("prompt")
-    if prompt is not None and prompt != profile.prompt:
-        profile.expanded_topics = None  # invalidate cache on prompt change
-    if prompt is not None:
-        profile.prompt = prompt
-    if "frequency" in body:
-        profile.frequency = body["frequency"]
     if "scope" in body:
         profile.scope = body["scope"]
-    if "min_relevance_score" in body:
-        profile.min_relevance_score = body["min_relevance_score"]
     if "review_bills" in body:
         profile.review_bills = body["review_bills"]
 
@@ -786,15 +832,176 @@ def _format_profile(profile: UserProfile) -> Dict[str, Any]:
     return {
         "id": str(profile.id),
         "email": profile.email,
-        "prompt": profile.prompt,
-        "expanded_topics": profile.expanded_topics,
-        "frequency": profile.frequency,
+        "full_name": profile.full_name,
         "scope": profile.scope,
-        "min_relevance_score": profile.min_relevance_score,
         "review_bills": profile.review_bills or [],
+        "prompts": [
+            {
+                "id": str(p.id),
+                "prompt_text": p.prompt_text,
+                "frequency": p.frequency,
+                "expanded_topics": p.expanded_topics,
+                "created_at": p.created_at.isoformat(),
+                "updated_at": p.updated_at.isoformat(),
+            }
+            for p in profile.prompts
+        ],
         "created_at": profile.created_at.isoformat(),
         "updated_at": profile.updated_at.isoformat(),
     }
+
+
+@app.get("/users/{email}/prompts", response_model=List[Dict[str, Any]])
+def get_user_prompts(email: str, db: Session = Depends(get_db)):
+    """Fetch all tracking prompts for a user."""
+    profile = db.query(UserProfile).filter(UserProfile.email == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+    return [
+        {
+            "id": str(p.id),
+            "prompt_text": p.prompt_text,
+            "frequency": p.frequency,
+            "expanded_topics": p.expanded_topics,
+            "created_at": p.created_at.isoformat(),
+            "updated_at": p.updated_at.isoformat(),
+        }
+        for p in profile.prompts
+    ]
+
+
+@app.post("/users/{email}/prompts", response_model=Dict[str, Any])
+def create_user_prompt(email: str, body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Create a new tracking prompt for a user."""
+    profile = db.query(UserProfile).filter(UserProfile.email == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    prompt_text = (body.get("prompt_text") or "").strip()
+    if not prompt_text:
+        raise HTTPException(status_code=400, detail="prompt_text is required")
+
+    frequency = body.get("frequency", "daily")
+    if frequency not in ["daily", "weekly"]:
+        raise HTTPException(status_code=400, detail="frequency must be 'daily' or 'weekly'")
+
+    # Run AI expansion
+    expansion = None
+    if prompt_text:
+        try:
+            expansion = expand_prompt_to_topics(prompt_text, db=db, user_email=email.lower())
+        except Exception as e:
+            pass
+
+    new_prompt = UserPrompt(
+        user_id=profile.id,
+        prompt_text=prompt_text,
+        frequency=frequency,
+        expanded_topics=expansion,
+    )
+    db.add(new_prompt)
+    db.commit()
+    db.refresh(new_prompt)
+
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except:
+        pass
+
+    return {
+        "id": str(new_prompt.id),
+        "prompt_text": new_prompt.prompt_text,
+        "frequency": new_prompt.frequency,
+        "expanded_topics": new_prompt.expanded_topics,
+        "created_at": new_prompt.created_at.isoformat(),
+        "updated_at": new_prompt.updated_at.isoformat(),
+    }
+
+
+@app.put("/users/{email}/prompts/{prompt_id}", response_model=Dict[str, Any])
+def update_user_prompt(email: str, prompt_id: str, body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Update an existing tracking prompt."""
+    profile = db.query(UserProfile).filter(UserProfile.email == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    import uuid
+    try:
+        p_uuid = uuid.UUID(prompt_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid prompt_id format")
+
+    prompt = db.query(UserPrompt).filter(UserPrompt.id == p_uuid, UserPrompt.user_id == profile.id).first()
+    if not prompt:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+
+    prompt_text = body.get("prompt_text")
+    if prompt_text is not None:
+        prompt_text = prompt_text.strip()
+        if not prompt_text:
+            raise HTTPException(status_code=400, detail="prompt_text cannot be empty")
+        
+        # If text changed, trigger re-expansion
+        if prompt_text != prompt.prompt_text:
+            prompt.prompt_text = prompt_text
+            try:
+                prompt.expanded_topics = expand_prompt_to_topics(prompt_text, db=db, user_email=email.lower())
+            except Exception as e:
+                prompt.expanded_topics = None
+
+    if "frequency" in body:
+        frequency = body["frequency"]
+        if frequency not in ["daily", "weekly"]:
+            raise HTTPException(status_code=400, detail="frequency must be 'daily' or 'weekly'")
+        prompt.frequency = frequency
+
+    db.commit()
+    db.refresh(prompt)
+
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except:
+        pass
+
+    return {
+        "id": str(prompt.id),
+        "prompt_text": prompt.prompt_text,
+        "frequency": prompt.frequency,
+        "expanded_topics": prompt.expanded_topics,
+        "created_at": prompt.created_at.isoformat(),
+        "updated_at": prompt.updated_at.isoformat(),
+    }
+
+
+@app.delete("/users/{email}/prompts/{prompt_id}")
+def delete_user_prompt(email: str, prompt_id: str, db: Session = Depends(get_db)):
+    """Delete a tracking prompt."""
+    profile = db.query(UserProfile).filter(UserProfile.email == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    import uuid
+    try:
+        p_uuid = uuid.UUID(prompt_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid prompt_id format")
+
+    prompt = db.query(UserPrompt).filter(UserPrompt.id == p_uuid, UserPrompt.user_id == profile.id).first()
+    if not prompt:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+
+    db.delete(prompt)
+    db.commit()
+
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except:
+        pass
+
+    return {"detail": "Prompt deleted successfully"}
 
 
 @app.get("/users/{email}/review-bills")
@@ -1125,6 +1332,7 @@ async def auth_signup(body: Dict[str, Any], db: Session = Depends(get_db)):
 
     email = (body.get("email") or "").strip().lower()
     password = (body.get("password") or "").strip()
+    full_name = (body.get("name") or body.get("full_name") or "").strip() or None
 
     if not email:
         raise HTTPException(status_code=400, detail="email is required")
@@ -1138,6 +1346,7 @@ async def auth_signup(body: Dict[str, Any], db: Session = Depends(get_db)):
     token = generate_verification_token()
     profile = UserProfile(
         email=email,
+        full_name=full_name,
         password_hash=hash_password(password),
         is_verified=False,
         verification_token=token,

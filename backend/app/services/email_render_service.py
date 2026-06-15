@@ -41,7 +41,8 @@ def render_digest_html(payload: Dict[str, Any]) -> str:
             "digest_metadata":   { "generated_at", "time_window_start",
                                    "time_window_end", "total_items", ... },
             "overall_summary":   str | None,
-            "items":             [ { bill fields } ]
+            "items":             [ { bill fields } ],
+            "prompt_groups":     [ { "prompt_text", "items": [ { bill fields } ] } ]
         }
 
     Returns
@@ -72,6 +73,17 @@ def render_digest_html(payload: Dict[str, Any]) -> str:
     else:
         preheader_text = "No new updates this period — check back soon."
 
+    # Retrieve prompt groups or fallback to items
+    prompt_groups = payload.get("prompt_groups")
+    if not prompt_groups:
+        if items:
+            prompt_groups = [{
+                "prompt_text": "LEGISLATIVE UPDATES",
+                "items": items
+            }]
+        else:
+            prompt_groups = []
+
     ctx: Dict[str, Any] = {
         "subject": f"ALDF {period_label} — {payload.get('digest_metadata', {}).get('generated_at', '')[:10]}",
         "preheader_text": preheader_text,
@@ -81,6 +93,7 @@ def render_digest_html(payload: Dict[str, Any]) -> str:
         "digest_metadata": payload.get("digest_metadata", {}),
         "overall_summary": payload.get("overall_summary"),
         "items": items,
+        "prompt_groups": prompt_groups,
         "frontend_url": settings.FRONTEND_URL.rstrip("/"),
     }
 

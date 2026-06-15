@@ -8,7 +8,7 @@ from datetime import datetime, date, timedelta
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from app.services.digest_service import compile_digests
-from app.models import UserProfile, LegislativeDocument, BillAction, Subject
+from app.models import UserProfile, LegislativeDocument, BillAction, Subject, UserPrompt
 
 class TestDigestPipeline(unittest.TestCase):
 
@@ -31,13 +31,11 @@ class TestDigestPipeline(unittest.TestCase):
             if doc.source_id == "HR-101":
                 return 85
             elif doc.source_id == "HR-102":
-                return 60
+                return 40
             elif doc.source_id == "HR-103":
                 return 50
             elif doc.source_id == "HR-104":
                 return 90
-            return 0
-        
         mock_score.side_effect = mock_score_side_effect
 
         # 2. Construct mock users
@@ -45,11 +43,19 @@ class TestDigestPipeline(unittest.TestCase):
         user_daily.id = "user-uuid-1"
         user_daily.email = "daily@example.com"
         user_daily.is_verified = True
-        user_daily.frequency = "daily"
-        user_daily.prompt = "Save the dogs and cats"
         user_daily.scope = "federal"
-        user_daily.min_relevance_score = 70
         user_daily.review_bills = ["HR-103"]  # watched review bill
+
+        # Mock the new prompts relationship
+        mock_prompt = MagicMock(spec=UserPrompt)
+        mock_prompt.id = "prompt-uuid-1"
+        mock_prompt.prompt_text = "Save the dogs and cats"
+        mock_prompt.frequency = "daily"
+        mock_prompt.expanded_topics = {
+            "topics": ["animal welfare", "veterinary"],
+            "keywords": ["dog", "cat"]
+        }
+        user_daily.prompts = [mock_prompt]
 
         # 3. Construct mock documents and actions
         # Today's date
@@ -70,7 +76,7 @@ class TestDigestPipeline(unittest.TestCase):
         doc1.last_action_text = "Referred to committee"
         doc1.subjects = []
 
-        # Document 2: Matching but score < 70
+        # Document 2: Matching but score < 50
         doc2 = MagicMock(spec=LegislativeDocument)
         doc2.id = "doc-uuid-2"
         doc2.source = "congress.gov"
@@ -78,7 +84,7 @@ class TestDigestPipeline(unittest.TestCase):
         doc2.source_url = None
         doc2.title = "Veterinary Training Act"
         doc2.policy_area = "Education"
-        doc2.relevance_score = 60
+        doc2.relevance_score = 40
         doc2.relevance_topics = ["veterinary"]
         doc2.ai_summary = "A bill about vets."
         doc2.last_action_date = today
@@ -133,9 +139,12 @@ class TestDigestPipeline(unittest.TestCase):
         
         def query_side_effect(model_class):
             if model_class == UserProfile:
-                # Mock chain for user query
+                # Mock chain for user query: filter(...).options(...).all()
                 mock_filter = MagicMock()
-                mock_filter.all.return_value = [user_daily]
+                mock_options = MagicMock()
+                mock_filter.options.return_value = mock_options
+                mock_options.all.return_value = [user_daily]
+                
                 mock_query_builder = MagicMock()
                 mock_query_builder.filter.return_value = mock_filter
                 return mock_query_builder

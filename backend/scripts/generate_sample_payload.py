@@ -20,8 +20,14 @@ def main():
             print("No verified user found in the database.")
             return
 
-        print(f"Temporarily setting user {user.email} frequency to 'weekly' within transaction...")
-        user.frequency = "weekly"
+        from app.models import UserPrompt
+        # Create a temp weekly prompt
+        weekly_prompt = UserPrompt(
+            user_id=user.id,
+            prompt_text="Save the animal habitat",
+            frequency="weekly",
+        )
+        db.add(weekly_prompt)
         db.flush()
 
         # Run compile_digests for weekly frequency

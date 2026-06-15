@@ -802,3 +802,155 @@ input[type="date"]::-webkit-calendar-picker-indicator:hover {
 .user-menu-item:hover {
   background: rgba(239, 68, 68, 0.1);
 }
+
+/* ── Prompts Grid ── */
+.prompts-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 1.5rem;
+  margin-top: 1.5rem;
+}
+
+.prompt-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 1.25rem;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+  position: relative;
+}
+
+.prompt-card:hover {
+  border-color: var(--c-teal);
+  background: var(--bg-elevated);
+  box-shadow: 0 4px 20px rgba(0, 168, 158, 0.1), 0 0 0 1px var(--c-teal-glow);
+  transform: translateY(-2px);
+}
+
+.prompt-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.prompt-card-text {
+  font-size: 0.95rem;
+  color: var(--text-primary);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.prompt-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.prompt-badge {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 0.25rem 0.6rem;
+  border-radius: var(--radius-sm);
+  background: rgba(0, 168, 158, 0.1);
+  color: var(--c-teal-bright);
+  border: 1px solid var(--c-teal);
+}
+
+.prompt-badge.weekly {
+  background: rgba(139, 92, 246, 0.1);
+  color: #a78bfa;
+  border-color: #8b5cf6;
+}
+
+.prompt-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-top: auto;
+}
+
+.btn-icon-danger {
+  background: transparent;
+  border: 1px solid var(--border-default);
+  color: var(--c-error);
+  padding: 0.4rem;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.btn-icon-danger:hover {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: var(--c-error);
+}
+
+.btn-icon-edit {
+  background: transparent;
+  border: 1px solid var(--border-default);
+  color: var(--text-secondary);
+  padding: 0.4rem;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.btn-icon-edit:hover {
+  background: var(--bg-deep);
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+/* Prompt Card Add New */
+.prompt-card-add {
+  border: 2px dashed var(--border-default);
+  background: transparent;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  color: var(--text-secondary);
+  transition: all 0.3s ease;
+  cursor: pointer;
+}
+
+.prompt-card-add:hover {
+  border-color: var(--c-teal);
+  color: var(--c-teal-bright);
+  background: rgba(0, 168, 158, 0.02);
+}
+
+.add-icon-wrapper {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 1px dashed var(--border-default);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.25rem;
+  transition: all 0.3s ease;
+}
+
+.prompt-card-add:hover .add-icon-wrapper {
+  border-color: var(--c-teal);
+  background: rgba(0, 168, 158, 0.1);
+}

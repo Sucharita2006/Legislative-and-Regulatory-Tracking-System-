@@ -20,11 +20,14 @@ def main():
         print("=" * 60)
 
         # 1. Total verified/daily/weekly users
+        from app.models import UserPrompt
+        from sqlalchemy.orm import selectinload
+
         total_verified = db.query(UserProfile).filter(UserProfile.is_verified == True).count()
-        total_daily = db.query(UserProfile).filter(UserProfile.frequency == "daily").count()
-        total_daily_verified = db.query(UserProfile).filter(UserProfile.is_verified == True, UserProfile.frequency == "daily").count()
-        total_weekly = db.query(UserProfile).filter(UserProfile.frequency == "weekly").count()
-        total_weekly_verified = db.query(UserProfile).filter(UserProfile.is_verified == True, UserProfile.frequency == "weekly").count()
+        total_daily = db.query(UserProfile).join(UserPrompt).filter(UserPrompt.frequency == "daily").distinct().count()
+        total_daily_verified = db.query(UserProfile).join(UserPrompt).filter(UserProfile.is_verified == True, UserPrompt.frequency == "daily").distinct().count()
+        total_weekly = db.query(UserProfile).join(UserPrompt).filter(UserPrompt.frequency == "weekly").distinct().count()
+        total_weekly_verified = db.query(UserProfile).join(UserPrompt).filter(UserProfile.is_verified == True, UserPrompt.frequency == "weekly").distinct().count()
 
         print(f"Total Verified Users: {total_verified}")
         print(f"Total Daily Users (Verified/Total): {total_daily_verified}/{total_daily}")
@@ -63,10 +66,10 @@ def main():
         print("=" * 60)
 
         # Retrieve daily users
-        daily_users = db.query(UserProfile).filter(
+        daily_users = db.query(UserProfile).join(UserPrompt).filter(
             UserProfile.is_verified == True,
-            UserProfile.frequency == "daily"
-        ).all()
+            UserPrompt.frequency == "daily"
+        ).options(selectinload(UserProfile.prompts)).distinct().all()
 
         # Retrieve daily candidate docs
         candidate_docs = (
@@ -86,6 +89,8 @@ def main():
         else:
             successful_digests = 0
             for user in daily_users:
+                matching_prompts = [p for p in user.prompts if p.frequency == "daily"]
+                
                 # Track why documents are excluded for this user
                 excluded_reasons = {
                     "scope_mismatch": 0,
@@ -93,18 +98,25 @@ def main():
                     "total_candidates": len(candidate_docs)
                 }
 
-                expanded_topics = []
-                expanded_keywords = []
-                has_prompt = False
-                
-                if user.prompt and user.prompt.strip():
-                    has_prompt = True
-                    try:
-                        expansion = expand_prompt_to_topics(user.prompt, db=db, user_email=user.email)
-                        expanded_topics = expansion.get("topics") or []
-                        expanded_keywords = expansion.get("keywords") or []
-                    except Exception as e:
-                        print(f"  Warning: failed expanding topics/keywords for {user.email}: {e}")
+                # Pre-expand prompt topics/keywords
+                prompt_expansions = {}
+                for prompt in matching_prompts:
+                    expanded_topics = []
+                    expanded_keywords = []
+                    if prompt.expanded_topics:
+                        expanded_topics = prompt.expanded_topics.get("topics") or []
+                        expanded_keywords = prompt.expanded_topics.get("keywords") or []
+                    if not expanded_topics and not expanded_keywords and prompt.prompt_text.strip():
+                        try:
+                            expansion = expand_prompt_to_topics(prompt.prompt_text, db=db, user_email=user.email)
+                            expanded_topics = expansion.get("topics") or []
+                            expanded_keywords = expansion.get("keywords") or []
+                        except Exception:
+                            pass
+                    prompt_expansions[prompt.id] = {
+                        "topics": expanded_topics,
+                        "keywords": expanded_keywords
+                    }
 
                 user_digest_items = []
                 user_review_bills = set(user.review_bills or [])
@@ -112,16 +124,18 @@ def main():
                 for doc in candidate_docs:
                     is_review_bill = doc.source_id in user_review_bills
                     
-                    if has_prompt:
-                        score = score_against_prompt(doc, expanded_topics, expanded_keywords)
-                    else:
-                        score = doc.relevance_score or 0
-
                     if user.scope == "priority_states" and doc.source == "congress.gov":
                         excluded_reasons["scope_mismatch"] += 1
                         continue
 
-                    if not is_review_bill and score < user.min_relevance_score:
+                    best_score = -1
+                    for prompt in matching_prompts:
+                        exp = prompt_expansions[prompt.id]
+                        score = score_against_prompt(doc, exp["topics"], exp["keywords"])
+                        if score >= 50 and score > best_score:
+                            best_score = score
+
+                    if best_score == -1 and not is_review_bill:
                         excluded_reasons["below_threshold"] += 1
                         continue
 
@@ -164,24 +178,33 @@ def main():
         else:
             successful_digests_7d = 0
             for user in daily_users:
+                matching_prompts = [p for p in user.prompts if p.frequency == "daily"]
+                
                 excluded_reasons = {
                     "scope_mismatch": 0,
                     "below_threshold": 0,
                     "total_candidates": len(candidate_docs_7d)
                 }
 
-                expanded_topics = []
-                expanded_keywords = []
-                has_prompt = False
-                
-                if user.prompt and user.prompt.strip():
-                    has_prompt = True
-                    try:
-                        expansion = expand_prompt_to_topics(user.prompt, db=db, user_email=user.email)
-                        expanded_topics = expansion.get("topics") or []
-                        expanded_keywords = expansion.get("keywords") or []
-                    except Exception as e:
-                        print(f"  Warning: failed expanding topics/keywords for {user.email}: {e}")
+                # Pre-expand prompt topics/keywords
+                prompt_expansions = {}
+                for prompt in matching_prompts:
+                    expanded_topics = []
+                    expanded_keywords = []
+                    if prompt.expanded_topics:
+                        expanded_topics = prompt.expanded_topics.get("topics") or []
+                        expanded_keywords = prompt.expanded_topics.get("keywords") or []
+                    if not expanded_topics and not expanded_keywords and prompt.prompt_text.strip():
+                        try:
+                            expansion = expand_prompt_to_topics(prompt.prompt_text, db=db, user_email=user.email)
+                            expanded_topics = expansion.get("topics") or []
+                            expanded_keywords = expansion.get("keywords") or []
+                        except Exception:
+                            pass
+                    prompt_expansions[prompt.id] = {
+                        "topics": expanded_topics,
+                        "keywords": expanded_keywords
+                    }
 
                 user_digest_items = []
                 user_review_bills = set(user.review_bills or [])
@@ -189,20 +212,22 @@ def main():
                 for doc in candidate_docs_7d:
                     is_review_bill = doc.source_id in user_review_bills
                     
-                    if has_prompt:
-                        score = score_against_prompt(doc, expanded_topics, expanded_keywords)
-                    else:
-                        score = doc.relevance_score or 0
-
                     if user.scope == "priority_states" and doc.source == "congress.gov":
                         excluded_reasons["scope_mismatch"] += 1
                         continue
 
-                    if not is_review_bill and score < user.min_relevance_score:
+                    best_score = -1
+                    for prompt in matching_prompts:
+                        exp = prompt_expansions[prompt.id]
+                        score = score_against_prompt(doc, exp["topics"], exp["keywords"])
+                        if score >= 50 and score > best_score:
+                            best_score = score
+
+                    if best_score == -1 and not is_review_bill:
                         excluded_reasons["below_threshold"] += 1
                         continue
 
-                    user_digest_items.append((doc.source_id, score))
+                    user_digest_items.append((doc.source_id, max(best_score, doc.relevance_score or 0)))
 
                 if user_digest_items:
                     successful_digests_7d += 1

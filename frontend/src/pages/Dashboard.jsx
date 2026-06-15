@@ -10,7 +10,11 @@ import {
   updateUser,
   createUser,
   fetchSubjectsGrouped,
-  fetchReviewBills
+  fetchReviewBills,
+  fetchUserPrompts,
+  createUserPrompt,
+  updateUserPrompt,
+  deleteUserPrompt
 } from '../services/api';
 import { ThemeToggle } from '../components/ThemeToggle';
 import './Dashboard.css';
@@ -50,6 +54,13 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
   const [prefMinScore, setPrefMinScore] = useState(70);
   const [prefExpandedTopics, setPrefExpandedTopics] = useState([]);
   const [prefStatus, setPrefStatus] = useState('');
+
+  // ── Prompts Management State
+  const [prompts, setPrompts] = useState([]);
+  const [editingPrompt, setEditingPrompt] = useState(null); // null or the prompt object being edited
+  const [isPromptModalOpen, setIsPromptModalOpen] = useState(false);
+  const [modalPromptText, setModalPromptText] = useState('');
+  const [modalPromptFrequency, setModalPromptFrequency] = useState('daily');
   
   const [activeTab, setActiveTab] = useState('yesterday'); // yesterday, recent, search, live, prefs
   const [searchFiltersOpen, setSearchFiltersOpen] = useState(false);
@@ -105,15 +116,15 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
     // Load prefs
     getUser(userEmail).then(data => {
       if (data) {
-        setPrefPrompt(data.prompt || '');
-        setPrefFrequency(data.frequency || 'daily');
         setPrefScope(data.scope || 'federal');
-        setPrefMinScore(data.min_relevance_score || 70);
-        setPrefExpandedTopics(data.expanded_topics || []);
+        setPrefMinScore(50);
         setReviewedBills(data.review_bills || []);
+        setPrompts(data.prompts || []);
 
-        if (data.prompt) {
-          fetchBills({ userPrompt: data.prompt, minScore: data.min_relevance_score, limit: 1 })
+        if (data.prompts && data.prompts.length > 0) {
+          setPrefPrompt(data.prompts[0].prompt_text);
+          // Calculate matching interests using the first prompt's score
+          fetchBills({ userPrompt: data.prompts[0].prompt_text, minScore: 50, limit: 1 })
             .then(res => setMatchingInterests(res.total || 0));
         }
       }
@@ -223,26 +234,84 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
   
   const handleSavePrefs = async () => {
     try {
-      const payload = {
-        email: userEmail,
-        prompt: prefPrompt,
-        frequency: prefFrequency,
-        scope: prefScope,
-        min_relevance_score: parseInt(prefMinScore, 10) || 70
-      };
-      const res = await createUser(payload); // Overwrites/updates
-      setPrefExpandedTopics(res.expanded_topics || []);
-      setPrefStatus('Preferences saved successfully!');
+      const res = await updateUser(userEmail, { scope: prefScope });
+      setPrefStatus('Settings saved successfully!');
       setTimeout(() => setPrefStatus(''), 3000);
-      
-      // Update matching interests based on new prompt
-      if (res.prompt) {
-        fetchBills({ userPrompt: res.prompt, minScore: res.min_relevance_score, limit: 1 })
-          .then(r => setMatchingInterests(r.total || 0));
-      }
     } catch (e) {
-      setPrefStatus('Failed to save preferences.');
+      setPrefStatus('Failed to save settings.');
       setTimeout(() => setPrefStatus(''), 3000);
+    }
+  };
+
+  const handleOpenAddPrompt = () => {
+    setEditingPrompt(null);
+    setModalPromptText('');
+    setModalPromptFrequency('daily');
+    setIsPromptModalOpen(true);
+  };
+
+  const handleOpenEditPrompt = (e, prompt) => {
+    e.stopPropagation();
+    setEditingPrompt(prompt);
+    setModalPromptText(prompt.prompt_text);
+    setModalPromptFrequency(prompt.frequency);
+    setIsPromptModalOpen(true);
+  };
+
+  const handleSavePrompt = async (e) => {
+    e.preventDefault();
+    if (!modalPromptText.trim()) return;
+
+    try {
+      let newPrompts;
+      if (editingPrompt) {
+        const updated = await updateUserPrompt(userEmail, editingPrompt.id, {
+          prompt_text: modalPromptText.trim(),
+          frequency: modalPromptFrequency
+        });
+        newPrompts = prompts.map(p => p.id === editingPrompt.id ? updated : p);
+      } else {
+        const created = await createUserPrompt(userEmail, {
+          prompt_text: modalPromptText.trim(),
+          frequency: modalPromptFrequency
+        });
+        newPrompts = [...prompts, created];
+      }
+      setPrompts(newPrompts);
+      if (newPrompts.length > 0) {
+        setPrefPrompt(newPrompts[0].prompt_text);
+        fetchBills({ userPrompt: newPrompts[0].prompt_text, minScore: 50, limit: 1 })
+          .then(res => setMatchingInterests(res.total || 0));
+      } else {
+        setPrefPrompt('');
+        setMatchingInterests(0);
+      }
+      setIsPromptModalOpen(false);
+      setEditingPrompt(null);
+      setModalPromptText('');
+    } catch (err) {
+      alert('Failed to save tracking interest: ' + err.message);
+    }
+  };
+
+  const handleDeletePrompt = async (e, promptId) => {
+    e.stopPropagation();
+    if (!window.confirm('Are you sure you want to delete this tracking interest?')) return;
+
+    try {
+      await deleteUserPrompt(userEmail, promptId);
+      const newPrompts = prompts.filter(p => p.id !== promptId);
+      setPrompts(newPrompts);
+      if (newPrompts.length > 0) {
+        setPrefPrompt(newPrompts[0].prompt_text);
+        fetchBills({ userPrompt: newPrompts[0].prompt_text, minScore: 50, limit: 1 })
+          .then(res => setMatchingInterests(res.total || 0));
+      } else {
+        setPrefPrompt('');
+        setMatchingInterests(0);
+      }
+    } catch (err) {
+      alert('Failed to delete tracking interest: ' + err.message);
     }
   };
   
@@ -543,74 +612,81 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
           {/* Preferences Panel */}
           {activeTab === 'prefs' && (
             <div className="panel-section visible">
-               <div className="prefs-header">
-                  <h2><i className="fa-solid fa-sliders"></i> Tracking Preferences</h2>
-                  <p className="prefs-subtitle">Configure what legislation you want to monitor. Your prompt is converted into structured tracking topics.</p>
+              <div className="prefs-header">
+                <h2><i className="fa-solid fa-sliders"></i> Tracking Preferences</h2>
+                <p className="prefs-subtitle">Configure the email notification scope and manage your saved animal interest tracking prompts.</p>
               </div>
-              <div className="prefs-form">
+
+              {/* General Settings: Scope */}
+              <div className="prefs-form" style={{ marginBottom: '2rem' }}>
+                <h3 style={{ fontSize: '1.1rem', marginBottom: '1rem', color: 'var(--text-primary)' }}>General Notification Settings</h3>
+                <div className="prefs-row" style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1.5rem' }}>
                   <div className="prefs-field">
-                      <label>Your Email <span style={{color: 'var(--c-teal)'}}>*</span></label>
-                      <div className="input-with-icon">
-                        <i className="fa-solid fa-envelope"></i>
-                        <input 
-                           type="email" 
-                           value={userEmail || ''} 
-                           readOnly 
-                           disabled 
-                           style={{ opacity: 0.7, cursor: 'not-allowed' }} 
-                        />
-                      </div>
+                    <label>Your Email</label>
+                    <div className="input-with-icon">
+                      <i className="fa-solid fa-envelope"></i>
+                      <input type="email" value={userEmail || ''} readOnly disabled style={{ opacity: 0.7, cursor: 'not-allowed' }} />
+                    </div>
                   </div>
                   <div className="prefs-field">
-                      <label>Tracking Prompt</label>
-                      <p style={{fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-tertiary)', marginBottom: '0.5rem'}}>Describe what legislation you want to track. Examples: "Track farm animal welfare bills", "Track animal testing regulations".</p>
-                      <textarea rows="3" value={prefPrompt} onChange={e=>setPrefPrompt(e.target.value)} placeholder="e.g. Track farm animal welfare bills and livestock protection legislation"></textarea>
+                    <label>Notification Scope</label>
+                    <div className="input-with-icon">
+                      <i className="fa-solid fa-globe"></i>
+                      <select value={prefScope} onChange={e => setPrefScope(e.target.value)}>
+                        <option value="federal">Federal Only</option>
+                        <option value="priority_states">Priority States</option>
+                        <option value="all_states">All States</option>
+                      </select>
+                    </div>
                   </div>
-                  <div className="prefs-row" style={{display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '1rem'}}>
-                      <div className="prefs-field">
-                          <label>Digest Frequency</label>
-                          <div className="input-with-icon">
-                            <i className="fa-regular fa-calendar"></i>
-                            <select value={prefFrequency} onChange={e=>setPrefFrequency(e.target.value)}>
-                              <option value="daily">Daily</option>
-                              <option value="weekly">Weekly</option>
-                              <option value="realtime">Real-time</option>
-                            </select>
-                          </div>
+                </div>
+                <div className="prefs-actions" style={{ marginTop: '1.5rem' }}>
+                  <button className="btn btn-primary" onClick={handleSavePrefs}><i className="fa-solid fa-floppy-disk"></i> Save Settings</button>
+                </div>
+                {prefStatus && <div style={{ marginTop: '1rem', color: 'var(--c-teal)' }}>{prefStatus}</div>}
+              </div>
+
+              {/* Tracking Interests Prompts Grid */}
+              <div style={{ marginTop: '2rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                  <h3 style={{ fontSize: '1.1rem', color: 'var(--text-primary)', margin: 0 }}>Saved Tracking Interests</h3>
+                  <button className="btn btn-primary" onClick={handleOpenAddPrompt}>
+                    <i className="fa-solid fa-plus"></i> Add Interest
+                  </button>
+                </div>
+                <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem', marginBottom: '1.5rem' }}>
+                  Each tracking interest is evaluated by our AI engine with a fixed minimum relevance score of 50.
+                </p>
+
+                <div className="prompts-grid">
+                  {prompts.map(prompt => (
+                    <div key={prompt.id} className="prompt-card" onClick={(e) => handleOpenEditPrompt(e, prompt)}>
+                      <div className="prompt-card-body">
+                        <div className="prompt-card-header">
+                          <span className={`prompt-badge ${prompt.frequency}`}>
+                            {prompt.frequency === 'daily' ? 'Daily Digest' : 'Weekly Digest'}
+                          </span>
+                        </div>
+                        <p className="prompt-card-text">{prompt.prompt_text}</p>
                       </div>
-                      <div className="prefs-field">
-                          <label>Scope</label>
-                          <div className="input-with-icon">
-                            <i className="fa-solid fa-globe"></i>
-                            <select value={prefScope} onChange={e=>setPrefScope(e.target.value)}>
-                              <option value="federal">Federal</option>
-                              <option value="state">State</option>
-                              <option value="local">Local</option>
-                            </select>
-                          </div>
-                      </div>
-                      <div className="prefs-field">
-                          <label>Minimum Relevance Score</label>
-                          <div className="input-with-icon">
-                            <i className="fa-solid fa-crosshairs"></i>
-                            <input type="number" min="0" max="100" value={prefMinScore} onChange={e=>setPrefMinScore(e.target.value)} />
-                          </div>
-                          <p style={{fontFamily: 'var(--font-mono)', fontSize: '0.7rem', color: 'var(--text-tertiary)', marginTop: '0.5rem'}}>Bills scoring below this threshold are filtered out. Default: 70</p>
-                      </div>
-                  </div>
-                  <div className="prefs-actions" style={{display:'flex', gap:'1rem', marginTop:'1.5rem'}}>
-                      <button className="btn btn-primary" onClick={handleSavePrefs}><i className="fa-solid fa-floppy-disk"></i> Save Preferences</button>
-                      <button className="btn btn-secondary" onClick={() => handleTabClick('search')}><i className="fa-solid fa-filter"></i> Apply to Current View</button>
-                  </div>
-                  {prefStatus && <div style={{marginTop:'1rem', color:'var(--c-teal)'}}>{prefStatus}</div>}
-                  {prefExpandedTopics.length > 0 && (
-                    <div style={{marginTop:'1.5rem'}}>
-                      <label style={{fontFamily:'var(--font-mono)', fontSize:'0.72rem', color:'var(--text-secondary)'}}>AI EXPANDED TOPICS</label>
-                      <div className="pill-container" style={{marginTop:'0.5rem'}}>
-                        {prefExpandedTopics.map(t => <span key={t} className="subject-pill">{t}</span>)}
+                      <div className="prompt-card-actions">
+                        <button className="btn-icon-edit" title="Edit Interest" onClick={(e) => handleOpenEditPrompt(e, prompt)}>
+                          <i className="fa-solid fa-pen"></i>
+                        </button>
+                        <button className="btn-icon-danger" title="Delete Interest" onClick={(e) => handleDeletePrompt(e, prompt.id)}>
+                          <i className="fa-solid fa-trash"></i>
+                        </button>
                       </div>
                     </div>
-                  )}
+                  ))}
+
+                  <div className="prompt-card prompt-card-add" onClick={handleOpenAddPrompt}>
+                    <div className="add-icon-wrapper">
+                      <i className="fa-solid fa-plus"></i>
+                    </div>
+                    <span>Add New Tracking Interest</span>
+                  </div>
+                </div>
               </div>
             </div>
           )}
@@ -868,6 +944,59 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
               )}
 
             </div>
+          </div>
+        </div>
+      )}
+      {/* ── Prompt Editor Modal ── */}
+      {isPromptModalOpen && (
+        <div className="modal-overlay active" onClick={e => e.target.classList.contains('modal-overlay') && setIsPromptModalOpen(false)}>
+          <div className="modal-container detail-modal-new" style={{ maxWidth: '500px' }}>
+            <button className="modal-close-btn" onClick={() => setIsPromptModalOpen(false)}>
+              <i className="fa-solid fa-xmark"></i>
+            </button>
+
+            <div className="modal-header-new" style={{ marginBottom: '1.5rem', paddingBottom: '1rem' }}>
+              <h2 className="modal-title-new" style={{ fontSize: '1.5rem' }}>
+                {editingPrompt ? 'Edit Tracking Interest' : 'Add Tracking Interest'}
+              </h2>
+            </div>
+
+            <form onSubmit={handleSavePrompt} className="prefs-form" style={{ background: 'none', border: 'none', padding: 0 }}>
+              <div className="prefs-field">
+                <label>Tracking Prompt text <span style={{ color: 'var(--c-teal)' }}>*</span></label>
+                <p style={{ fontFamily: 'var(--font-mono)', fontSize: '0.72rem', color: 'var(--text-tertiary)', marginBottom: '0.5rem' }}>
+                  Describe what legislation you want to track (e.g. "Track farm animal welfare bills").
+                </p>
+                <textarea
+                  rows="3"
+                  value={modalPromptText}
+                  onChange={e => setModalPromptText(e.target.value)}
+                  placeholder="e.g. factory farming, wildlife trafficking, animal testing"
+                  required
+                />
+              </div>
+
+              <div className="prefs-field">
+                <label>Digest Notification Frequency</label>
+                <div className="input-with-icon">
+                  <i className="fa-regular fa-calendar"></i>
+                  <select
+                    value={modalPromptFrequency}
+                    onChange={e => setModalPromptFrequency(e.target.value)}
+                  >
+                    <option value="daily">Daily Digest</option>
+                    <option value="weekly">Weekly Digest</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="prefs-actions" style={{ display: 'flex', gap: '1rem', marginTop: '2rem', justifyContent: 'flex-end' }}>
+                <button type="button" className="btn btn-secondary" onClick={() => setIsPromptModalOpen(false)}>Cancel</button>
+                <button type="submit" className="btn btn-primary">
+                  <i className="fa-solid fa-floppy-disk"></i> {editingPrompt ? 'Save Changes' : 'Add Interest'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

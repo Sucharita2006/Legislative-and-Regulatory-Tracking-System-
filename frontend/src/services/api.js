@@ -164,6 +164,32 @@ export async function fetchReviewBills(email) {
   return request(`/users/${encodeURIComponent(email)}/review-bills`);
 }
 
+// ── User Prompts ─────────────────────────────────────────────────────────────
+
+export async function fetchUserPrompts(email) {
+  return request(`/users/${encodeURIComponent(email)}/prompts`);
+}
+
+export async function createUserPrompt(email, body) {
+  return request(`/users/${encodeURIComponent(email)}/prompts`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function updateUserPrompt(email, promptId, body) {
+  return request(`/users/${encodeURIComponent(email)}/prompts/${encodeURIComponent(promptId)}`, {
+    method: 'PUT',
+    body: JSON.stringify(body),
+  });
+}
+
+export async function deleteUserPrompt(email, promptId) {
+  return request(`/users/${encodeURIComponent(email)}/prompts/${encodeURIComponent(promptId)}`, {
+    method: 'DELETE',
+  });
+}
+
 // ── Health & Sync ─────────────────────────────────────────────────────────────
 
 export async function checkHealth() {
@@ -185,10 +211,10 @@ export async function fetchLiveSearch(prompt, date, userEmail = null) {
 
 // ── Auth API ─────────────────────────────────────────────────────────────────
 
-export async function signup(email, password) {
+export async function signup(email, password, name) {
   return request('/auth/signup', {
     method: 'POST',
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ email, password, name }),
   });
 }
 

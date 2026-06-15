@@ -124,6 +124,7 @@ class UserProfile(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     # Auth fields
     password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
@@ -131,14 +132,37 @@ class UserProfile(Base):
     verification_token: Mapped[Optional[str]] = mapped_column(String(36), nullable=True, unique=True)
 
     # Preferences
-    prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    expanded_topics: Mapped[Optional[list]] = mapped_column(JSONB, nullable=True)  # persisted expansion cache
-    frequency: Mapped[str] = mapped_column(String(20), default="daily")  # 'daily' | 'weekly'
     scope: Mapped[str] = mapped_column(String(20), default="federal")    # 'federal' | 'priority_states' | 'all_states'
-    min_relevance_score: Mapped[int] = mapped_column(Integer, default=70)
     review_bills: Mapped[list] = mapped_column(JSONB, nullable=False, server_default='[]', default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+
+    # One-to-many prompts relationship
+    prompts: Mapped[List["UserPrompt"]] = relationship(
+        "UserPrompt",
+        back_populates="user",
+        cascade="all, delete-orphan"
+    )
+
+
+class UserPrompt(Base):
+    __tablename__ = "user_prompts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user_profiles.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False
+    )
+    prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
+    frequency: Mapped[str] = mapped_column(String(20), default="daily") # 'daily' | 'weekly'
+    expanded_topics: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now())
+
+    # Relationship back to UserProfile
+    user: Mapped["UserProfile"] = relationship("UserProfile", back_populates="prompts")
 
 
 class BillAction(Base):

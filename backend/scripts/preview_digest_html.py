@@ -182,11 +182,15 @@ def _build_real_payload(email: str) -> dict:
             print(f"[preview] No user found with email: {email}")
             sys.exit(1)
 
-        payloads = compile_digests(db, frequency=user.frequency)
+        frequency = "daily"
+        if user.prompts:
+            frequency = user.prompts[0].frequency
+
+        payloads = compile_digests(db, frequency=frequency)
         matched = [p for p in payloads if p["recipient"]["email"] == email]
         if not matched:
             print(f"[preview] No digest payload compiled for {email} — using empty-state mock.")
-            return _build_empty_mock_payload(user.frequency)
+            return _build_empty_mock_payload(frequency)
 
         return matched[0]
     finally:

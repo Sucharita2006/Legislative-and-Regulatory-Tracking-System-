@@ -8,6 +8,7 @@ export default function LandingPage({ onLogin, theme, toggleTheme, justVerified,
   const [authMode, setAuthMode] = useState(() => activationToken ? 'activate' : 'login'); // 'login', 'signup', 'activate'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [name, setName] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [signupSuccess, setSignupSuccess] = useState(false); // "check your email" state
@@ -25,6 +26,7 @@ export default function LandingPage({ onLogin, theme, toggleTheme, justVerified,
   const scrollToAuth = (mode) => {
     setAuthMode(mode);
     setError('');
+    setName('');
     setTimeout(() => {
       document.getElementById('auth-section')?.scrollIntoView({ behavior: 'smooth' });
     }, 50);
@@ -37,7 +39,7 @@ export default function LandingPage({ onLogin, theme, toggleTheme, justVerified,
 
     try {
       if (authMode === 'signup') {
-        await signup(email, password);
+        await signup(email, password, name);
         setSignupSuccess(true); // Show "check your email" screen
       } else if (authMode === 'activate') {
         const res = await verifyAndActivate(email, password, activationToken);
@@ -268,6 +270,18 @@ export default function LandingPage({ onLogin, theme, toggleTheme, justVerified,
               </p>
 
               <form onSubmit={handleSubmit} className="auth-form">
+                {authMode === 'signup' && (
+                  <div className="input-group">
+                    <label>Full Name</label>
+                    <input
+                      type="text"
+                      className={`input-field ${error ? 'error-shake' : ''}`}
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
+                      required
+                    />
+                  </div>
+                )}
                 <div className="input-group">
                   <label>Email address</label>
                   <input
@@ -313,11 +327,11 @@ export default function LandingPage({ onLogin, theme, toggleTheme, justVerified,
 
               <div className="auth-footer">
                 {authMode === 'activate' ? (
-                  <p><a onClick={() => { setAuthMode('login'); onActivationDismiss(); setError(''); }}>Back to sign in</a></p>
+                  <p><a onClick={() => { setAuthMode('login'); onActivationDismiss(); setError(''); setName(''); }}>Back to sign in</a></p>
                 ) : authMode === 'login' ? (
-                  <p>New to ALDF? <a onClick={() => { setAuthMode('signup'); setError(''); }}>Create an account</a></p>
+                  <p>New to ALDF? <a onClick={() => { setAuthMode('signup'); setError(''); setName(''); }}>Create an account</a></p>
                 ) : (
-                  <p>Already have an account? <a onClick={() => { setAuthMode('login'); setError(''); }}>Sign in</a></p>
+                  <p>Already have an account? <a onClick={() => { setAuthMode('login'); setError(''); setName(''); }}>Sign in</a></p>
                 )}
               </div>
             </>
