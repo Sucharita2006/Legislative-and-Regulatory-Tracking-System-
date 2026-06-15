@@ -30,6 +30,9 @@ from pathlib import Path
 ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
+from dotenv import load_dotenv
+load_dotenv(ROOT / ".env")
+
 os.environ.setdefault("CONGRESS_API_KEY", "preview_dummy")
 os.environ.setdefault("DATABASE_URL",     "postgresql://preview_dummy")
 os.environ.setdefault("OPENROUTER_API_KEY", "preview_dummy")
