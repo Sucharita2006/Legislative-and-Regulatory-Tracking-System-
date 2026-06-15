@@ -55,12 +55,12 @@ def _build_mock_payload(frequency: str = "daily") -> dict:
             "generated_at": now.isoformat() + "Z",
             "time_window_start": (now - timedelta(hours=window_hours)).isoformat() + "Z",
             "time_window_end": now.isoformat() + "Z",
-            "total_items": 2,
+            "total_items": 4,
             "max_items_limit": 10,
         },
         "overall_summary": (
-            "Two bills with direct animal welfare implications moved forward this period, "
-            "including a key farm practices bill cleared from committee."
+            "Four bills with animal welfare and wildlife protection implications moved forward this period, "
+            "including new legislation on cosmetics safety, wildlife habitat, and pandemic prevention."
         ),
         "items": [
             {
@@ -108,6 +108,52 @@ def _build_mock_payload(frequency: str = "daily") -> dict:
                 "last_action": {
                     "action_date": (now - timedelta(days=2)).date().isoformat(),
                     "text": "Read twice and referred to the Committee on Environment and Public Works.",
+                },
+            },
+            {
+                "document_id": "119-HR-1234",
+                "title": "Humane Cosmetics Act of 2025",
+                "policy_area": "Commerce",
+                "relevance_score": 85,
+                "is_review_bill": False,
+                "match_reason": {
+                    "matched_topics": ["animal testing", "cosmetics safety"],
+                    "matched_keywords": ["cosmetics", "animal testing"],
+                    "explanation": "Matched interest topics: animal testing, cosmetics safety",
+                },
+                "ai_summary": (
+                    "Phases out the use of live animals in cosmetics testing within U.S. jurisdictions, "
+                    "prohibiting the sale or transport of cosmetics tested on animals after January 2026. "
+                    "Promotes validated alternative testing methods."
+                ),
+                "app_detail_url": "http://localhost:5173?tab=recent&bill=119-HR-1234",
+                "external_source_url": "https://www.congress.gov/bill/119th-congress/house-bill/1234",
+                "last_action": {
+                    "action_date": (now - timedelta(days=3)).date().isoformat(),
+                    "text": "Referred to the Subcommittee on Health.",
+                },
+            },
+            {
+                "document_id": "119-S-5678",
+                "title": "Preventing Future Pandemics Act of 2025",
+                "policy_area": "Foreign Relations",
+                "relevance_score": 70,
+                "is_review_bill": False,
+                "match_reason": {
+                    "matched_topics": ["wildlife trafficking", "wet markets"],
+                    "matched_keywords": ["wildlife market", "zoonotic disease"],
+                    "explanation": "Matches search keywords: wildlife market, zoonotic disease",
+                },
+                "ai_summary": (
+                    "Addresses public health concerns by establishing international bans on commercial "
+                    "wildlife markets and wildlife trafficking. Incentivizes transition of wild animal "
+                    "markets to sustainable food sources to prevent zoonotic outbreaks."
+                ),
+                "app_detail_url": "http://localhost:5173?tab=recent&bill=119-S-5678",
+                "external_source_url": "https://www.congress.gov/bill/119th-congress/senate-bill/5678",
+                "last_action": {
+                    "action_date": (now - timedelta(days=4)).date().isoformat(),
+                    "text": "Committee on Foreign Relations. Hearings held.",
                 },
             },
         ],
