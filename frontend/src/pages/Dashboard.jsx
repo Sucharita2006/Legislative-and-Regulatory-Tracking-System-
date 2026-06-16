@@ -128,8 +128,13 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
             .then(res => setMatchingInterests(res.total || 0));
         }
       }
-    }).catch(e => console.log('No prefs found'));
-  }, [userEmail]);
+    }).catch(e => {
+      console.error('Failed to load user profile:', e);
+      if (e.message && (e.message.includes('404') || e.message.includes('401') || e.message.includes('403'))) {
+        onLogout();
+      }
+    });
+  }, [userEmail, onLogout]);
 
   useEffect(() => {
     if (activeTab === 'yesterday' || activeTab === 'recent' || activeTab === 'search' || activeTab === 'review') {
