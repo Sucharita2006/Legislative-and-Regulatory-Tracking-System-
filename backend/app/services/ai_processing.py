@@ -132,7 +132,7 @@ def _parse_llm_json(content: str) -> Dict[str, Any]:
 
         This converts literal newlines/tabs/carriage-returns into their
         escaped sequences ("\\n", "\\t", "\\r") and other control
-        chars into `\u00XX` escapes so the JSON decoder can accept them.
+        chars into ``\\u00XX`` escapes so the JSON decoder can accept them.
         """
         def _repl(m: re.Match) -> str:
             ch = m.group(0)
