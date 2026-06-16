@@ -8,7 +8,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import LegislativeDocument, UserProfile
+from ..models import LegislativeDocument, UserProfile, UserPrompt
 from .congress_api import CongressAPIClient
 from sqlalchemy.orm import Session
 
@@ -180,12 +180,15 @@ def expand_prompt_to_topics(user_prompt: str, db: Optional[Session] = None, user
     if cached is not None:
         return cached
 
-    # 2. Persistent UserProfile cache
+    # 2. Persistent UserPrompt cache
     if db and user_email:
-        profile = db.query(UserProfile).filter(UserProfile.email == user_email).first()
-        if profile and profile.expanded_topics and profile.prompt == user_prompt:
-            set_cache(prompt_key, profile.expanded_topics, expire=3600)
-            return profile.expanded_topics
+        prompt_record = db.query(UserPrompt).join(UserProfile).filter(
+            UserProfile.email == user_email,
+            UserPrompt.prompt_text == user_prompt
+        ).first()
+        if prompt_record and prompt_record.expanded_topics:
+            set_cache(prompt_key, prompt_record.expanded_topics, expire=3600)
+            return prompt_record.expanded_topics
 
     url = f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions"
     headers = {
