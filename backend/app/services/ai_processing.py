@@ -124,12 +124,49 @@ def _parse_llm_json(content: str) -> Dict[str, Any]:
     """Parse the model's JSON reply, tolerating ```json fences or surrounding prose."""
     try:
         return json.loads(content)
+    except json.JSONDecodeError as first_exc:
+        logger.debug("Initial JSON parse failed, attempting sanitization: %s", first_exc)
+
+    def _sanitize_control_chars(s: str) -> str:
+        """Replace raw control characters with safe JSON escapes.
+
+        This converts literal newlines/tabs/carriage-returns into their
+        escaped sequences ("\\n", "\\t", "\\r") and other control
+        chars into `\u00XX` escapes so the JSON decoder can accept them.
+        """
+        def _repl(m: re.Match) -> str:
+            ch = m.group(0)
+            o = ord(ch)
+            if ch == "\n":
+                return "\\n"
+            if ch == "\r":
+                return "\\r"
+            if ch == "\t":
+                return "\\t"
+            return "\\u%04x" % o
+
+        # Replace all C0 control chars (0x00-0x1f)
+        return re.sub(r"[\x00-\x1f]", _repl, s)
+
+    # Try sanitizing the whole content and parse again
+    try:
+        sanitized = _sanitize_control_chars(content)
+        return json.loads(sanitized)
     except json.JSONDecodeError:
-        # Fall back to extracting the first {...} block.
-        match = re.search(r"\{.*\}", content, re.DOTALL)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+        logger.debug("Sanitized parse failed, attempting to extract JSON object from sanitized content.")
+
+    # As a last resort try to extract the first {...} block, sanitize it, and parse
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        # Re-raise the original parse error to preserve context
+        raise first_exc
+
+    try:
+        obj_text = _sanitize_control_chars(match.group(0))
+        return json.loads(obj_text)
+    except json.JSONDecodeError:
+        logger.exception("Failed to parse LLM JSON after sanitization and extraction.")
+        raise
 
 
 def _normalize_output(raw: Dict[str, Any]) -> Tuple[int, List[str], str, str]:
