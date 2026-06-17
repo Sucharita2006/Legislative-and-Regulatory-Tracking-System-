@@ -96,6 +96,7 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
   const [selectedBill, setSelectedBill] = useState(null);
   const [modalTab, setModalTab] = useState('overview'); // overview, ai, history, raw
   const [aiLoading, setAiLoading] = useState(false);
+  const [modalDetailsLoading, setModalDetailsLoading] = useState(false);
 
   const formatDisplayDate = (dateStr) => {
     if (!dateStr) return 'N/A';
@@ -339,6 +340,7 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
   const handleBillClick = async (bill) => {
     setSelectedBill(bill);
     setModalTab('overview');
+    setModalDetailsLoading(true);
     try {
       const [details, actionsData] = await Promise.all([
         fetchBillDetails(bill.source_id),
@@ -351,6 +353,9 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
       }));
       setSelectedBill({ ...details, action_history: actionHistory });
     } catch (err) {}
+    finally {
+      setModalDetailsLoading(false);
+    }
   };
   
   const runAiAnalysis = async () => {
@@ -801,9 +806,9 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
 
       {/* ── Detail Modal ──────────────────────────────────────────────────────── */}
       {selectedBill && (
-        <div className="modal-overlay active" onClick={e => e.target.classList.contains('modal-overlay') && setSelectedBill(null)}>
+        <div className="modal-overlay active" onClick={e => e.target.classList.contains('modal-overlay') && (setSelectedBill(null), setModalDetailsLoading(false))}>
           <div className="modal-container detail-modal-new">
-            <button className="modal-close-btn" onClick={() => setSelectedBill(null)}>
+            <button className="modal-close-btn" onClick={() => { setSelectedBill(null); setModalDetailsLoading(false); }}>
               <i className="fa-solid fa-xmark"></i>
             </button>
 
@@ -894,6 +899,8 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
                   <h4 className="section-title-new">AI INTELLIGENCE REPORT</h4>
                   {aiLoading ? (
                     <div style={{ padding: '2rem', textAlign: 'center' }}><i className="fa-solid fa-spinner fa-spin"></i> Analyzing bill text...</div>
+                  ) : modalDetailsLoading ? (
+                    <div style={{ padding: '2rem', textAlign: 'center' }}><i className="fa-solid fa-spinner fa-spin"></i> Loading analysis...</div>
                   ) : !selectedBill.ai_generated_at ? (
                     <div style={{ padding: '2rem', textAlign: 'center', background: 'var(--bg-secondary)', borderRadius: '8px' }}>
                       <i className="fa-solid fa-brain" style={{ fontSize: '2rem', color: 'var(--c-teal)', marginBottom: '1rem', display: 'block' }}></i>
@@ -934,6 +941,9 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
               {modalTab === 'history' && (
                 <div className="modal-section-new">
                   <h4 className="section-title-new">ACTION HISTORY</h4>
+                  {modalDetailsLoading ? (
+                    <div style={{ padding: '2rem', textAlign: 'center' }}><i className="fa-solid fa-spinner fa-spin"></i> Loading action history...</div>
+                  ) : (
                   <div className="action-history-list">
                     {(selectedBill.action_history?.length > 0 ? selectedBill.action_history : [{ date: selectedBill.last_action_date, text: selectedBill.last_action_text, source: selectedBill.origin_chamber }]).map((item, i) => (
                       <div key={i} className="history-item">
@@ -945,6 +955,7 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
                       </div>
                     ))}
                   </div>
+                  )}
                 </div>
               )}
 
