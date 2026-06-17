@@ -161,6 +161,17 @@ def process_bill(
             db.commit()
         return BillResult(OUTCOME_INACTIVE, source_id, api_requests)
 
+    # Skip all API calls if the bill is already stored and Congress.gov reports
+    # the same updateDate — nothing has changed, so the hash will match anyway.
+    list_update_date = parse_datetime(list_bill.get("updateDate"))
+    if list_update_date is not None:
+        existing_doc = db.query(LegislativeDocument).filter(
+            LegislativeDocument.source_id == source_id
+        ).first()
+        if existing_doc and existing_doc.update_date == list_update_date:
+            print(f"Skipping {source_id} — updateDate unchanged ({list_update_date}).")
+            return BillResult(OUTCOME_UNCHANGED, source_id, api_requests, existing_doc)
+
     # Fetch subjects to evaluate matching rules.
     print(f"Checking subjects for {source_id}...")
     subjects_data = client.fetch_bill_subjects(congress, bill_type, bill_number)
