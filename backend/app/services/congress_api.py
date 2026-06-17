@@ -12,9 +12,12 @@ class CongressAPIClient:
         self.api_key = settings.CONGRESS_API_KEY.strip()
         
         # User-Agent is explicitly set to prevent Cloudflare/API gateway blocks
+        # Increase timeout to handle slower responses from the Congress.gov API.
+        # Keep a reasonably long read timeout to avoid aborting the whole sync
+        # for intermittent slow endpoints.
         self.client = httpx.Client(
             headers={"User-Agent": "AnimalLegislationTracker/1.0"},
-            timeout=60.0
+            timeout=120.0
         )
 
     def _request(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

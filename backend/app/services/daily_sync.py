@@ -69,13 +69,21 @@ def process_daily_sync():
 
             for list_bill in bills:
                 records_processed += 1
-                result = process_bill(
-                    db=db,
-                    client=client,
-                    list_bill=list_bill,
-                    congress=CURRENT_CONGRESS,
-                    active_subject_names=active_subject_names,
-                )
+                try:
+                    result = process_bill(
+                        db=db,
+                        client=client,
+                        list_bill=list_bill,
+                        congress=CURRENT_CONGRESS,
+                        active_subject_names=active_subject_names,
+                    )
+                except Exception as e:
+                    # Log and continue so a single problematic bill doesn't abort the
+                    # entire daily sync. process_bill already logs and swallows
+                    # some sub-errors, but network/read timeouts can bubble up here.
+                    logger.exception(f"Failed processing bill entry: {e}")
+                    # Continue to next bill without incrementing counts for this one.
+                    continue
                 if result is None:
                     continue
 
