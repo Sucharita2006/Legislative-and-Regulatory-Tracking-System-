@@ -15,7 +15,7 @@ import json
 from datetime import date
 
 from .database import get_db
-from .models import LegislativeDocument, SyncLog, Base, Subject, UserProfile, UserPrompt
+from .models import LegislativeDocument, SyncLog, Base, Subject, UserProfile, UserPrompt, BillAction
 from .services.sync import seed_animal_subjects, run_historical_backfill
 from .services.matching import get_current_stage, SUBJECT_CATEGORIES
 from .services.ai_processing import process_bill_ai, expand_prompt_to_topics, score_against_prompt
@@ -314,18 +314,55 @@ def search_documents(
 
 @app.get("/documents/{source_id}/actions")
 def get_document_actions(source_id: str, db: Session = Depends(get_db)):
-    """Fetch the full action history for a bill live from Congress.gov and refresh the DB cache."""
+    """Return action history from DB cache; fall back to Congress.gov if none stored."""
     doc = db.query(LegislativeDocument).filter(LegislativeDocument.source_id == source_id).first()
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
+
+    stored = (
+        db.query(BillAction)
+        .filter(BillAction.document_id == doc.id)
+        .order_by(BillAction.action_date.desc())
+        .all()
+    )
+    if stored:
+        actions = [
+            {
+                "actionDate": a.action_date.isoformat(),
+                "text": a.text,
+                "actionCode": a.action_code,
+                "sourceSystem": {"name": a.source_system_name, "code": a.source_system_code},
+            }
+            for a in stored
+        ]
+        return {"actions": actions}
+
+    # Nothing cached — fetch live and persist
     try:
         client = CongressAPIClient()
         result = client.fetch_bill_actions(doc.congress, doc.bill_type, doc.bill_number)
         actions = result.get("actions", [])
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch actions from Congress.gov: {e}")
-    # Persist the freshest action back to the DB so the card stays current
+
     if actions:
+        for act in actions:
+            action_date_str = act.get("actionDate")
+            try:
+                action_date = date.fromisoformat(action_date_str) if action_date_str else None
+            except ValueError:
+                action_date = None
+            if not action_date or not act.get("text"):
+                continue
+            db.add(BillAction(
+                document_id=doc.id,
+                action_code=act.get("actionCode"),
+                action_date=action_date,
+                text=act["text"],
+                action_type=act.get("type"),
+                source_system_code=act.get("sourceSystem", {}).get("code"),
+                source_system_name=act.get("sourceSystem", {}).get("name"),
+            ))
         latest = actions[0]
         action_date_str = latest.get("actionDate")
         action_text = latest.get("text")
@@ -336,7 +373,8 @@ def get_document_actions(source_id: str, db: Session = Depends(get_db)):
         if new_date and action_text and (new_date != doc.last_action_date or action_text != doc.last_action_text):
             doc.last_action_date = new_date
             doc.last_action_text = action_text
-            db.commit()
+        db.commit()
+
     return {"actions": actions}
 
 
