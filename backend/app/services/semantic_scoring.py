@@ -39,7 +39,7 @@ ALDF_PRIORITY_BILLS = {
     # Companion Animals
     "119-HR-349", "119-HR-2253", "119-HR-3732", "119-S-1939", "119-HR-712",
     # Equines
-    "119-S-1377", "119-HR-4356",
+    "119-HR-4356",
     # Wildlife & Captivity
     "119-HR-1897", "119-HR-3199", "119-S-1594", "119-HR-4422",
     # Marine
