@@ -2,6 +2,7 @@ import os
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import List
+import json
 
 class Settings(BaseSettings):
     CONGRESS_API_KEY: str
@@ -16,9 +17,11 @@ class Settings(BaseSettings):
     )
 
     # Optional list of fallback model names (tried in order) if the primary
-    # `LLM_MODEL` fails (e.g. provider/model EOL). These names are passed to
-    # the OpenRouter `model` parameter. Can be set via env `FALLBACK_LLM_MODELS`.
-    FALLBACK_LLM_MODELS: List[str] = Field(default_factory=lambda: ["gpt-4o-mini"]) 
+    # `LLM_MODEL` fails (e.g. provider/model EOL). To avoid strict JSON parsing
+    # failures from empty/Railway values, accept a raw string in the env and
+    # normalize it after Settings is created. The env can be either a JSON
+    # array like '["gpt-4o-mini"]' or a comma-separated string 'gpt-4o-mini,gpt-4o'.
+    FALLBACK_LLM_MODELS: str = Field(default="")
 
     REDIS_URL: str = "redis://localhost:6379"
 
@@ -51,3 +54,18 @@ class Settings(BaseSettings):
     )
 
 settings = Settings()
+
+# Normalize `FALLBACK_LLM_MODELS` into a runtime list. Support JSON array
+# or comma-separated env value. If empty, result will be an empty list.
+raw_fb = settings.FALLBACK_LLM_MODELS or ""
+try:
+    parsed = json.loads(raw_fb) if raw_fb else []
+    if isinstance(parsed, list):
+        settings.FALLBACK_LLM_MODELS = [str(x) for x in parsed]
+    elif isinstance(parsed, str) and parsed:
+        settings.FALLBACK_LLM_MODELS = [parsed]
+    else:
+        settings.FALLBACK_LLM_MODELS = []
+except Exception:
+    # Fallback to comma-split parsing
+    settings.FALLBACK_LLM_MODELS = [s.strip() for s in raw_fb.split(",") if s.strip()]
