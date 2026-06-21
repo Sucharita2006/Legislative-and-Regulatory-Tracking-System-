@@ -34,13 +34,22 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
 
     start_date = start_time.date()
 
-    # 3. Candidate bills with recent actions
+    # 3. Candidate bills with recent actions — union of two sources:
+    #    (a) bills with a matching BillAction row in the window
+    #    (b) bills whose last_action_date falls in the window but BillAction sync may have failed
     candidate_docs = (
         db.query(LegislativeDocument)
-        .join(BillAction, LegislativeDocument.id == BillAction.document_id)
         .options(selectinload(LegislativeDocument.subjects))
-        .filter(BillAction.action_date >= start_date)
-        .distinct(LegislativeDocument.id)
+        .filter(
+            or_(
+                LegislativeDocument.id.in_(
+                    db.query(BillAction.document_id)
+                    .filter(BillAction.action_date >= start_date)
+                    .distinct()
+                ),
+                LegislativeDocument.last_action_date >= start_date,
+            )
+        )
         .all()
     )
     if not candidate_docs:
@@ -61,6 +70,7 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
         for prompt in matching_prompts:
             emb = prompt_embedding_for_digest(prompt.prompt_text)
             prompt_embeddings[str(prompt.id)] = emb
+            print(f"[DEBUG] Prompt '{prompt.prompt_text}' embedding: {'OK len={}'.format(len(emb)) if emb else 'NONE — embedding failed'}")
 
         user_digest_items = []
 
