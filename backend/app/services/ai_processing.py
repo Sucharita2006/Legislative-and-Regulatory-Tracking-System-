@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import re
@@ -183,8 +184,19 @@ def _parse_llm_json(content: str) -> Dict[str, Any]:
         obj_text = _sanitize_control_chars(match.group(0))
         return json.loads(obj_text)
     except json.JSONDecodeError:
-        logger.exception("Failed to parse LLM JSON after sanitization and extraction.")
-        raise
+        pass
+
+    # Last resort: model may have returned a Python dict literal (single quotes).
+    # ast.literal_eval is safe — it only evaluates literals, not arbitrary code.
+    try:
+        result = ast.literal_eval(match.group(0))
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+
+    logger.exception("Failed to parse LLM JSON after sanitization and extraction.")
+    raise first_exc
 
 
 def _normalize_output(raw: Dict[str, Any]) -> Tuple[int, List[str], str, str]:
