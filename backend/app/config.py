@@ -1,6 +1,7 @@
 import os
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import List
 
 class Settings(BaseSettings):
     CONGRESS_API_KEY: str
@@ -13,6 +14,11 @@ class Settings(BaseSettings):
         default="anthropic/claude-sonnet-4.5",
         validation_alias=AliasChoices("LLM_MODEL", "OPENROUTER_MODEL"),
     )
+
+    # Optional list of fallback model names (tried in order) if the primary
+    # `LLM_MODEL` fails (e.g. provider/model EOL). These names are passed to
+    # the OpenRouter `model` parameter. Can be set via env `FALLBACK_LLM_MODELS`.
+    FALLBACK_LLM_MODELS: List[str] = Field(default_factory=lambda: ["gpt-4o-mini"]) 
 
     REDIS_URL: str = "redis://localhost:6379"
 

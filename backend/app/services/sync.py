@@ -377,9 +377,15 @@ def process_bill(
         from .ai_processing import process_bill_ai
         process_bill_ai(doc, db=db)
     except Exception as e:
-        print(f"Warning: AI scoring failed for {source_id}: {e}. Discarding bill (no score).")
-        db.delete(doc)
-        db.commit()
+        # If AI fails (model errors, API issues), keep the document in the DB
+        # rather than deleting it. Deleting causes data loss when AI is
+        # temporarily unavailable (e.g. model EOL or provider outage).
+        print(f"Warning: AI scoring failed for {source_id}: {e}. Keeping bill without AI output.")
+        # Ensure DB transaction is clean but do not remove the document.
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
         return BillResult(OUTCOME_NO_MATCH, source_id, api_requests)
 
     if doc.relevance_score is None or doc.relevance_score < AI_THRESHOLD:

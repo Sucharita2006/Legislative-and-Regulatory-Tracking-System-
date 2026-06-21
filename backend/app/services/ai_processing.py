@@ -94,30 +94,48 @@ def _call_llm(user_prompt: str) -> Dict[str, Any]:
         # Optional attribution headers recommended by OpenRouter.
         "X-Title": "AnimalLegislationTracker",
     }
-    payload = {
-        "model": settings.LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-    }
+    # Try the primary model first, then any fallbacks configured in settings.
+    models_to_try = [settings.LLM_MODEL] + list(getattr(settings, "FALLBACK_LLM_MODELS", []) or [])
+    last_exc: Optional[Exception] = None
 
-    with httpx.Client(timeout=120.0) as client:
-        response = client.post(url, headers=headers, json=payload)
+    for idx, model_name in enumerate(models_to_try):
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        }
         try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            body = response.text.strip()
-            detail = f"OpenRouter request failed with {response.status_code}"
-            if body:
-                detail = f"{detail}: {body[:1000]}"
-            raise RuntimeError(detail) from exc
-        data = response.json()
+            with httpx.Client(timeout=120.0) as client:
+                response = client.post(url, headers=headers, json=payload)
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    body = response.text.strip()
+                    detail = f"OpenRouter request failed with {response.status_code} for model {model_name}"
+                    if body:
+                        detail = f"{detail}: {body[:1000]}"
+                    last_exc = RuntimeError(detail)
+                    # If provider says model is EOL or 404, try next fallback if available
+                    if response.status_code == 404 and idx < len(models_to_try) - 1:
+                        continue
+                    raise last_exc from exc
+                data = response.json()
 
-    content = data["choices"][0]["message"]["content"]
-    return _parse_llm_json(content)
+            content = data["choices"][0]["message"]["content"]
+            return _parse_llm_json(content)
+        except Exception as e:
+            # Keep the last exception and try next model if available
+            last_exc = e
+            continue
+
+    # All model attempts failed — raise with the last error for visibility.
+    if last_exc:
+        raise RuntimeError(f"All LLM attempts failed: {last_exc}") from last_exc
+    raise RuntimeError("LLM call failed without exception detail")
 
 
 def _parse_llm_json(content: str) -> Dict[str, Any]:
