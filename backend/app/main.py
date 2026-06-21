@@ -568,7 +568,7 @@ def live_search(
 
     results = []
     for doc, action_date, action_text in docs_to_score:
-        prompt_score = score_against_prompt(doc, topics, keywords)
+        prompt_score = score_against_prompt(doc, topics, keywords, prompt_text=prompt)
         if prompt_score == 0:
             continue
         sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)

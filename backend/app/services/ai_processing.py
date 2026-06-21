@@ -318,17 +318,24 @@ def expand_prompt_to_topics(user_prompt: str, db: Optional[Session] = None, user
     return result
 
 
-def score_against_prompt(doc: LegislativeDocument, topics: List[str], keywords: List[str]) -> int:
-    """Score a document against expanded prompt topics and keywords.
+def score_against_prompt(doc: LegislativeDocument, topics: List[str], keywords: List[str], prompt_text: Optional[str] = None) -> int:
+    """Score a document against a user prompt using semantic similarity.
 
-    Weighted scoring:
-      relevance_topics match  → 40 pts each, capped at 80
-      subjects match          → 20 pts each, capped at 40
-      policy_area match       → 15 pts flat
-      title keyword match     → 5 pts each, capped at 15
-      ai_summary keyword match→ 3 pts each, capped at 6
-    Max raw = 156, normalized to 0-100.
+    When prompt_text is supplied (preferred), uses embedding-based cosine
+    similarity via semantic_scoring. Falls back to the original keyword/topic
+    scoring when embeddings are unavailable.
     """
+    # Semantic path — uses embedding cosine similarity
+    if prompt_text and prompt_text.strip():
+        try:
+            from .semantic_scoring import semantic_score, prompt_embedding_for_digest
+            emb = prompt_embedding_for_digest(prompt_text)
+            if emb is not None:
+                return semantic_score(doc, emb)
+        except Exception as e:
+            logger.warning(f"Semantic scoring failed, falling back: {e}")
+
+    # Keyword fallback (used when embedding call fails or prompt_text not given)
     if not topics and not keywords:
         return doc.relevance_score or 0
 
@@ -340,23 +347,14 @@ def score_against_prompt(doc: LegislativeDocument, topics: List[str], keywords: 
     summary_lower = (doc.ai_summary or "").lower()
     policy_lower = (doc.policy_area or "").lower()
 
-    # Topic hits
     topic_hits = len(topic_set & doc_topics)
     score += min(topic_hits * 40, 80)
-
-    # Subject hits (keywords against subject names)
     subject_hits = sum(1 for kw in keywords if any(kw in subj for subj in doc_subjects))
     score += min(subject_hits * 20, 40)
-
-    # Policy area hit
     if any(kw in policy_lower for kw in keywords) or policy_lower in {t.lower() for t in topics}:
         score += 15
-
-    # Title keyword hits
     title_hits = sum(1 for kw in keywords if kw in title_lower)
     score += min(title_hits * 5, 15)
-
-    # Summary keyword hits
     summary_hits = sum(1 for kw in keywords if kw in summary_lower)
     score += min(summary_hits * 3, 6)
 
