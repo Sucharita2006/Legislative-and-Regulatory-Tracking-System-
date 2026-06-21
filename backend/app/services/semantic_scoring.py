@@ -142,7 +142,7 @@ def semantic_score(doc: LegislativeDocument, prompt_embedding: List[float]) -> i
     # Map similarity to 0-100.
     # With enriched prompt text, related topic pairs land ~0.55-0.80.
     # Scale [0.25, 0.85] → [0, 100] to avoid filtering genuine matches.
-    low, high = 0.25, 0.85
+    low, high = 0.15, 0.75
     clamped = max(0.0, min(1.0, (sim - low) / (high - low)))
     return round(clamped * 100)
 
