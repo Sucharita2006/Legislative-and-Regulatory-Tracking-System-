@@ -25,9 +25,9 @@ def process_daily_sync():
     # Look back 3 days so bills whose Congress.gov updateDate lags behind
     # their actual action date (typically 1-2 days) are still captured.
     # Hash dedup in process_bill makes re-fetching already-stored bills cheap.
-    lookback_start = date.today() - timedelta(days=3)
+    lookback_start = date(2026, 6, 15)
     from_dt = f"{lookback_start.isoformat()}T00:00:00Z"
-    to_dt = f"{date.today().isoformat()}T00:00:00Z"
+    to_dt = "2026-06-21T23:59:59Z"
     logger.info(f"Starting daily sync for Congress {CURRENT_CONGRESS}, range {from_dt} to {to_dt}.")
 
     db = SessionLocal()
