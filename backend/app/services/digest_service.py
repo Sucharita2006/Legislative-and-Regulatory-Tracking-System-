@@ -9,7 +9,7 @@ from .ai_processing import expand_prompt_to_topics
 from .semantic_scoring import semantic_score, prompt_embedding_for_digest
 
 # Minimum semantic score (0-100) for a bill to appear in a digest.
-DIGEST_SCORE_THRESHOLD = 60
+DIGEST_SCORE_THRESHOLD = 50
 
 
 def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
@@ -68,7 +68,13 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
         # Pre-compute prompt embeddings (cached)
         prompt_embeddings: Dict[str, Any] = {}
         for prompt in matching_prompts:
-            emb = prompt_embedding_for_digest(prompt.prompt_text)
+            # Enrich the prompt text with expanded topics/keywords for a better embedding
+            exp = prompt.expanded_topics or {}
+            extra_terms = exp.get("keywords", []) + exp.get("topics", [])
+            enriched_text = prompt.prompt_text
+            if extra_terms:
+                enriched_text = prompt.prompt_text + " " + " ".join(extra_terms)
+            emb = prompt_embedding_for_digest(enriched_text)
             prompt_embeddings[str(prompt.id)] = emb
             print(f"[DEBUG] Prompt '{prompt.prompt_text}' embedding: {'OK len={}'.format(len(emb)) if emb else 'NONE — embedding failed'}")
 

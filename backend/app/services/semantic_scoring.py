@@ -28,6 +28,7 @@ EMBEDDING_MODEL = "openai/text-embedding-3-small"
 EMBEDDING_CACHE_TTL = 86_400  # 24 hours
 CACHE_PREFIX = "aldf:embed:"
 
+
 # Known ALDF-priority bill numbers mapped to their category.
 # Source: ALDF curated bill list. Bills in this set always score 100.
 ALDF_PRIORITY_BILLS = {
@@ -139,9 +140,9 @@ def semantic_score(doc: LegislativeDocument, prompt_embedding: List[float]) -> i
 
     sim = cosine_similarity(prompt_embedding, bill_embedding)
     # Map similarity to 0-100.
-    # text-embedding-3-small cosine sims for related animal-law text typically
-    # land 0.55-0.85; unrelated text 0.2-0.45. We scale [0.4, 0.9] → [0, 100].
-    low, high = 0.40, 0.90
+    # With enriched prompt text, related topic pairs land ~0.55-0.80.
+    # Scale [0.25, 0.85] → [0, 100] to avoid filtering genuine matches.
+    low, high = 0.25, 0.85
     clamped = max(0.0, min(1.0, (sim - low) / (high - low)))
     return round(clamped * 100)
 
