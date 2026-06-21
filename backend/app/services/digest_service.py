@@ -74,6 +74,7 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
 
         user_digest_items = []
 
+        print(f"[DEBUG] {len(candidate_docs)} candidate bills in window")
         for doc in candidate_docs:
             # Scope filter
             if user.scope == "priority_states" and doc.source == "congress.gov":
@@ -101,6 +102,7 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
                     best_score = score
                     best_prompt = prompt
 
+            print(f"[DEBUG] {doc.source_id} | score={best_score} | title={doc.title[:60] if doc.title else 'N/A'}")
             qualifies = best_score >= DIGEST_SCORE_THRESHOLD or is_review_bill
             if not qualifies:
                 continue
