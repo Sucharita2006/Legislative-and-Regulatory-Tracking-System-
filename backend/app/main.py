@@ -272,7 +272,7 @@ def search_documents(
     formatted_results = []
     for doc in results:
         sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
-        prompt_score = score_against_prompt(doc, expanded_topics, expanded_keywords) if prompt_expansion else doc.relevance_score
+        prompt_score = score_against_prompt(doc, expanded_topics, expanded_keywords, prompt_text=user_prompt) if prompt_expansion else doc.relevance_score
 
         # Apply min_score filter using prompt_score when a prompt is active, else relevance_score
         effective_score = prompt_score if prompt_expansion else (doc.relevance_score or 0)

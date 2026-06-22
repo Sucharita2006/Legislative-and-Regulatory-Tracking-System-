@@ -29,28 +29,6 @@ EMBEDDING_CACHE_TTL = 86_400  # 24 hours
 CACHE_PREFIX = "aldf:embed:"
 
 
-# Known ALDF-priority bill numbers mapped to their category.
-# Source: ALDF curated bill list. Bills in this set always score 100.
-ALDF_PRIORITY_BILLS = {
-    # Cruelty & Enforcement
-    "119-HR-1477", "119-HR-3112", "119-S-1538",
-    # Farmed Animals
-    "119-HR-4673", "119-HR-7567", "119-S-1326",
-    # Companion Animals
-    "119-HR-349", "119-HR-2253", "119-HR-3732", "119-S-1939", "119-HR-712",
-    # Equines
-    "119-HR-4356",
-    # Wildlife & Captivity
-    "119-HR-1897", "119-HR-3199", "119-S-1594", "119-HR-4422",
-    # Marine
-    "119-S-1947",
-    # Research
-    "119-HR-1085", "119-S-1802",
-    # Environmental / NEPA
-    "119-HR-4776", "119-HR-1526",
-}
-
-
 def _embed_via_openrouter(text: str) -> Optional[List[float]]:
     """Call OpenRouter embeddings endpoint and return the vector."""
     url = f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/embeddings"
@@ -120,15 +98,10 @@ def bill_text_for_embedding(doc: LegislativeDocument) -> str:
 def semantic_score(doc: LegislativeDocument, prompt_embedding: List[float]) -> int:
     """Return a 0-100 semantic relevance score for doc against a prompt embedding.
 
-    Priority bills (on ALDF's curated list) always return 100.
+    All bills — including ALDF priority bills — are scored by cosine similarity
+    so results reflect the actual prompt, not a curated list.
     Bills with no embeddable text return 0.
-    Otherwise: cosine similarity mapped to 0-100.
     """
-    # Layer 1 — exact known ALDF bill → automatic 100
-    if doc.source_id in ALDF_PRIORITY_BILLS:
-        return 100
-
-    # Layer 2 — semantic similarity
     bill_text = bill_text_for_embedding(doc)
     if not bill_text.strip():
         return 0
@@ -140,8 +113,7 @@ def semantic_score(doc: LegislativeDocument, prompt_embedding: List[float]) -> i
 
     sim = cosine_similarity(prompt_embedding, bill_embedding)
     # Map similarity to 0-100.
-    # With enriched prompt text, related topic pairs land ~0.55-0.80.
-    # Scale [0.25, 0.85] → [0, 100] to avoid filtering genuine matches.
+    # Scale [0.15, 0.75] → [0, 100].
     low, high = 0.15, 0.75
     clamped = max(0.0, min(1.0, (sim - low) / (high - low)))
     return round(clamped * 100)
