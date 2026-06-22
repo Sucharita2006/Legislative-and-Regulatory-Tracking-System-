@@ -2,6 +2,7 @@ from __future__ import annotations
 from fastapi import FastAPI, Depends, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import or_, func
 from typing import Dict, Any, List, Optional
@@ -24,6 +25,19 @@ from .services.congress_api import CongressAPIClient
 app = FastAPI(
     title="Animal Legislation Tracking System - Congress.gov Backfill Module",
     version="1.0.0"
+)
+
+_cors_origins = [o.strip() for o in os.environ.get(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
+).split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.on_event("startup")
@@ -884,6 +898,7 @@ def _format_profile(profile: UserProfile) -> Dict[str, Any]:
             }
             for p in profile.prompts
         ],
+        "is_verified": profile.is_verified,
         "created_at": profile.created_at.isoformat(),
         "updated_at": profile.updated_at.isoformat(),
     }

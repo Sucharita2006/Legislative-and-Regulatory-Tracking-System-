@@ -18,7 +18,7 @@ def get_mail_config() -> ConnectionConfig:
 
 async def send_verification_email(email: str, token: str):
     """Send an email verification link to the user."""
-    verify_url = f"{settings.FRONTEND_URL}/verify-email?token={token}"
+    verify_url = f"{settings.BACKEND_URL}/auth/verify/{token}"
 
     html_body = f"""
     <!DOCTYPE html>
