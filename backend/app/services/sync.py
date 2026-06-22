@@ -395,6 +395,14 @@ def process_bill(
         return BillResult(OUTCOME_NO_MATCH, source_id, api_requests)
     print(f"AI score {doc.relevance_score} for {source_id} — keeping.")
 
+    # Store the bill embedding for vector search. Best-effort: failures do not
+    # block the sync — the backfill script can fill gaps later.
+    try:
+        from .semantic_scoring import store_bill_embedding
+        store_bill_embedding(doc, db)
+    except Exception as e:
+        print(f"Warning: embedding failed for {source_id}: {e}")
+
     return BillResult(outcome, source_id, api_requests, doc)
 
 

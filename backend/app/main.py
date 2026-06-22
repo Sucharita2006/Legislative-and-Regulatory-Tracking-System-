@@ -269,10 +269,28 @@ def search_documents(
     fetch_limit = limit * 5 if prompt_expansion else limit
     results = query.distinct().offset(offset).limit(fetch_limit).all()
 
+    # When a user prompt is active, use pgvector ANN for accurate semantic scoring.
+    # Build a score lookup keyed by doc.id, then apply it when formatting results.
+    vector_score_map: Dict[Any, int] = {}
+    if prompt_expansion and user_prompt:
+        from .services.semantic_scoring import vector_search
+        vector_hits = vector_search(user_prompt, db, limit=limit * 3, min_score=0)
+        if vector_hits:
+            vector_score_map = {h["doc"].id: h["prompt_score"] for h in vector_hits}
+
     formatted_results = []
     for doc in results:
         sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
-        prompt_score = score_against_prompt(doc, expanded_topics, expanded_keywords, prompt_text=user_prompt) if prompt_expansion else doc.relevance_score
+
+        if prompt_expansion:
+            if vector_score_map:
+                # Use ANN score; skip bills not returned by vector search (score = 0)
+                prompt_score = vector_score_map.get(doc.id, 0)
+            else:
+                # Fall back to keyword scoring if vector search returned nothing
+                prompt_score = score_against_prompt(doc, expanded_topics, expanded_keywords, prompt_text=user_prompt)
+        else:
+            prompt_score = doc.relevance_score
 
         # Apply min_score filter using prompt_score when a prompt is active, else relevance_score
         effective_score = prompt_score if prompt_expansion else (doc.relevance_score or 0)
@@ -488,9 +506,20 @@ def live_search(
     body: Dict[str, Any],
     db: Session = Depends(get_db)
 ):
-    """Search stored bill_actions by date and score results against a prompt."""
+    """Search bills by semantic similarity using pgvector ANN search.
+
+    Primary path: vector_search() does a single ORDER BY <=> query — no keyword
+    pre-filtering, so semantically relevant bills are never excluded by missing
+    topic tags.
+
+    When a date filter is provided the ANN results are intersected with bills
+    that had an action on that date.
+
+    Falls back to keyword/topic scoring if embeddings are unavailable.
+    """
     from .models import BillAction
     from .services.ai_processing import expand_prompt_to_topics, score_against_prompt
+    from .services.semantic_scoring import vector_search
     from datetime import date as date_type
 
     prompt = (body.get("prompt") or "").strip()
@@ -514,36 +543,96 @@ def live_search(
     if cached_res is not None:
         return cached_res
 
-    # Expand prompt (cached if user_email provided)
     expansion = expand_prompt_to_topics(prompt, db=db, user_email=user_email)
+
+    # --- Primary path: pgvector ANN ---
+    vector_hits = vector_search(prompt, db, limit=40, min_score=10)
+
+    if vector_hits:
+        # Build a map from doc id → score for fast lookup
+        score_by_id = {h["doc"].id: h["prompt_score"] for h in vector_hits}
+        docs_map = {h["doc"].id: h["doc"] for h in vector_hits}
+
+        if parsed_date:
+            # Intersect ANN results with bills that had an action on the given date
+            action_rows = (
+                db.query(BillAction.document_id, BillAction.action_date, BillAction.text)
+                .filter(
+                    BillAction.action_date == parsed_date,
+                    BillAction.document_id.in_(list(docs_map.keys()))
+                )
+                .distinct(BillAction.document_id)
+                .all()
+            )
+            docs_to_format = [
+                (docs_map[r.document_id], r.action_date.isoformat(), r.text)
+                for r in action_rows
+                if r.document_id in docs_map
+            ]
+        else:
+            docs_to_format = [
+                (h["doc"], h["doc"].last_action_date.isoformat() if h["doc"].last_action_date else None, h["doc"].last_action_text)
+                for h in vector_hits
+            ]
+
+        results = []
+        for doc, action_date, action_text in docs_to_format:
+            sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+            results.append({
+                "source_id": doc.source_id,
+                "title": doc.title,
+                "bill_type": doc.bill_type,
+                "bill_number": doc.bill_number,
+                "origin_chamber": doc.origin_chamber,
+                "policy_area": doc.policy_area,
+                "action_date": action_date,
+                "action_text": action_text,
+                "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+                "last_action_text": doc.last_action_text,
+                "subjects": [s.name for s in doc.subjects],
+                "prompt_score": score_by_id[doc.id],
+                "relevance_score": doc.relevance_score,
+                "ai_summary": doc.ai_summary,
+                "source_url": doc.source_url,
+                "current_stage": get_current_stage(doc.last_action_text),
+                "sponsor_name": sp_name,
+                "sponsor_party": sp_party,
+                "sponsor_state": sp_state,
+            })
+
+        results.sort(key=lambda r: r["prompt_score"], reverse=True)
+        res = {
+            "date": search_date,
+            "prompt_expansion": expansion,
+            "total": len(results),
+            "results": results,
+        }
+        try:
+            set_cache(cache_key, res, expire=300)
+        except Exception:
+            pass
+        return res
+
+    # --- Fallback: keyword/topic pre-filter (used when no embeddings stored yet) ---
     topics = expansion.get("topics", [])
     keywords = expansion.get("keywords", [])
 
-    from sqlalchemy import or_, cast, func, text as sa_text
+    from sqlalchemy import or_, cast
     from sqlalchemy.dialects.postgresql import JSONB, ARRAY as PG_ARRAY
     from sqlalchemy.types import Text
 
-    # Build a SQL pre-filter so we only load bills that plausibly match the prompt.
-    # This avoids scoring every bill in Python — only the candidate set reaches Python.
     candidate_filters = []
-
-    # Any stored relevance_topic overlaps with expanded topics (JSONB ?| operator)
-    # The ?| operator requires text[] on the right side, not JSONB
     if topics:
         candidate_filters.append(
             LegislativeDocument.relevance_topics.cast(JSONB).op("?|")(
                 cast(topics, PG_ARRAY(Text))
             )
         )
-
-    # Title or policy_area contains any keyword (case-insensitive)
     for kw in keywords:
         candidate_filters.append(LegislativeDocument.title.ilike(f"%{kw}%"))
         candidate_filters.append(LegislativeDocument.policy_area.ilike(f"%{kw}%"))
 
     if parsed_date:
-        # Date provided: restrict to bills with an action on that day, then apply
-        # topic/keyword pre-filter on the joined documents.
         action_subq = (
             db.query(BillAction.document_id, BillAction.action_date, BillAction.text)
             .filter(BillAction.action_date == parsed_date)
@@ -555,19 +644,12 @@ def live_search(
             .join(action_subq, LegislativeDocument.id == action_subq.c.document_id)
             .options(selectinload(LegislativeDocument.subjects))
         )
-        # Still apply topic/keyword filter when we have signals; otherwise return all
-        # bills active on that date (user may be exploring).
         if candidate_filters:
             base_q = base_q.filter(or_(*candidate_filters))
         rows = base_q.all()
-        docs_to_score = [
-            (doc, action_date.isoformat(), action_text)
-            for doc, action_date, action_text in rows
-        ]
+        docs_to_score = [(doc, ad.isoformat(), at) for doc, ad, at in rows]
     else:
-        # No date: pre-filter by topic/keyword match in SQL — never loads the full table.
         if not candidate_filters:
-            # Prompt captured no topics or keywords; return nothing rather than full scan.
             return {"date": None, "prompt_expansion": expansion, "total": 0, "results": []}
         docs = (
             db.query(LegislativeDocument)
@@ -609,7 +691,6 @@ def live_search(
         })
 
     results.sort(key=lambda r: r["prompt_score"], reverse=True)
-
     res = {
         "date": search_date,
         "prompt_expansion": expansion,
@@ -618,7 +699,7 @@ def live_search(
     }
     try:
         set_cache(cache_key, res, expire=300)
-    except Exception as e:
+    except Exception:
         pass
     return res
 

@@ -1,12 +1,13 @@
-"""Semantic scoring via embeddings.
+"""Semantic scoring via embeddings + pgvector ANN search.
 
-Replaces the topic-keyword scoring in digest_service and live search with
-cosine similarity between an embedding of the user's prompt and an embedding
-of each bill's text (title + ai_summary + official_summary).
+Embedding model: openai/text-embedding-3-small via OpenRouter (1536 dims).
 
-Embedding model: openai/text-embedding-3-small via OpenRouter.
-Embeddings are cached in Redis (24-hour TTL) keyed by SHA-256 of the text,
-so each unique bill text is only embedded once.
+Two-level cache:
+  1. Redis (24h TTL, keyed by SHA-256 of text) — avoids re-embedding identical text.
+  2. DB column (legislative_documents.embedding) — persisted vector used for ANN search.
+
+For live search / Ask-tab queries, vector_search() does a single pgvector
+ORDER BY <=> (cosine distance) query instead of loading every bill into Python.
 """
 
 from __future__ import annotations
@@ -14,20 +15,34 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-from typing import List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import httpx
+from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import LegislativeDocument
 from .cache import get_cache, set_cache
 
+if TYPE_CHECKING:
+    pass
+
 logger = logging.getLogger("aldf.semantic")
 
 EMBEDDING_MODEL = "openai/text-embedding-3-small"
+EMBEDDING_DIMS = 1536
 EMBEDDING_CACHE_TTL = 86_400  # 24 hours
 CACHE_PREFIX = "aldf:embed:"
 
+# Cosine similarity scale: sim in [LOW, HIGH] maps linearly to score [0, 100].
+# text-embedding-3-small typically yields 0.2–0.85 for related animal-welfare text.
+_SIM_LOW = 0.20
+_SIM_HIGH = 0.75
+
+
+# ---------------------------------------------------------------------------
+# Embedding helpers
+# ---------------------------------------------------------------------------
 
 def _embed_via_openrouter(text: str) -> Optional[List[float]]:
     """Call OpenRouter embeddings endpoint and return the vector."""
@@ -54,7 +69,7 @@ def _cache_key(text: str) -> str:
 
 
 def get_embedding(text: str) -> Optional[List[float]]:
-    """Return embedding for text, using cache when available."""
+    """Return embedding for text, using Redis cache when available."""
     if not text or not text.strip():
         return None
     key = _cache_key(text)
@@ -67,23 +82,12 @@ def get_embedding(text: str) -> Optional[List[float]]:
     return vec
 
 
-def cosine_similarity(a: List[float], b: List[float]) -> float:
-    """Cosine similarity between two vectors, returns 0.0–1.0."""
-    dot = sum(x * y for x, y in zip(a, b))
-    mag_a = math.sqrt(sum(x * x for x in a))
-    mag_b = math.sqrt(sum(x * x for x in b))
-    if mag_a == 0 or mag_b == 0:
-        return 0.0
-    return dot / (mag_a * mag_b)
-
-
 def bill_text_for_embedding(doc: LegislativeDocument) -> str:
-    """Combine the most useful bill fields into a single text for embedding."""
+    """Build the text blob used to embed a bill."""
     parts = []
     if doc.title:
-        # Repeat title twice — it's the most signal-dense field.
         parts.append(doc.title)
-        parts.append(doc.title)
+        parts.append(doc.title)  # repeat — highest signal
     if doc.policy_area:
         parts.append(f"Policy area: {doc.policy_area}")
     if doc.subjects:
@@ -95,30 +99,127 @@ def bill_text_for_embedding(doc: LegislativeDocument) -> str:
     return " | ".join(parts)
 
 
-def semantic_score(doc: LegislativeDocument, prompt_embedding: List[float]) -> int:
-    """Return a 0-100 semantic relevance score for doc against a prompt embedding.
+def store_bill_embedding(doc: LegislativeDocument, db: Session) -> bool:
+    """Compute and persist the embedding for a bill to the DB column.
 
-    All bills — including ALDF priority bills — are scored by cosine similarity
-    so results reflect the actual prompt, not a curated list.
-    Bills with no embeddable text return 0.
+    Returns True if newly computed and saved, False if skipped (already set or
+    no embeddable text or embedding call failed).
     """
+    if doc.embedding is not None:
+        return False
+    text = bill_text_for_embedding(doc)
+    if not text.strip():
+        return False
+    vec = get_embedding(text)
+    if vec is None:
+        return False
+    doc.embedding = vec
+    db.commit()
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Score helpers (used by digest_service when iterating a small candidate set)
+# ---------------------------------------------------------------------------
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    mag_a = math.sqrt(sum(x * x for x in a))
+    mag_b = math.sqrt(sum(x * x for x in b))
+    if mag_a == 0 or mag_b == 0:
+        return 0.0
+    return dot / (mag_a * mag_b)
+
+
+def _sim_to_score(sim: float) -> int:
+    clamped = max(0.0, min(1.0, (sim - _SIM_LOW) / (_SIM_HIGH - _SIM_LOW)))
+    return round(clamped * 100)
+
+
+def semantic_score(doc: LegislativeDocument, prompt_embedding: List[float]) -> int:
+    """Return 0-100 score for doc against a pre-computed prompt embedding.
+
+    Used by digest_service which already has a small candidate set in memory.
+    Prefers the stored DB embedding to avoid re-embedding at query time.
+    Falls back to computing+caching the embedding if not stored yet.
+    """
+    # Prefer the already-stored vector
+    if doc.embedding is not None:
+        sim = cosine_similarity(prompt_embedding, list(doc.embedding))
+        return _sim_to_score(sim)
+
     bill_text = bill_text_for_embedding(doc)
     if not bill_text.strip():
         return 0
 
     bill_embedding = get_embedding(bill_text)
     if bill_embedding is None:
-        # Embedding failed — fall back to existing relevance_score if available
         return doc.relevance_score or 0
 
     sim = cosine_similarity(prompt_embedding, bill_embedding)
-    # Map similarity to 0-100.
-    # Scale [0.15, 0.75] → [0, 100].
-    low, high = 0.15, 0.75
-    clamped = max(0.0, min(1.0, (sim - low) / (high - low)))
-    return round(clamped * 100)
+    return _sim_to_score(sim)
 
 
 def prompt_embedding_for_digest(prompt_text: str) -> Optional[List[float]]:
-    """Get (or compute + cache) the embedding for a user's digest prompt."""
+    """Get (or compute + cache) the embedding for a digest prompt."""
     return get_embedding(prompt_text)
+
+
+# ---------------------------------------------------------------------------
+# pgvector ANN search — the primary search path for live/Ask queries
+# ---------------------------------------------------------------------------
+
+def vector_search(
+    prompt: str,
+    db: Session,
+    limit: int = 20,
+    min_score: int = 10,
+) -> List[Dict[str, Any]]:
+    """Search bills by semantic similarity to prompt using pgvector ANN.
+
+    Returns a list of dicts with keys:
+        doc         – LegislativeDocument ORM object
+        prompt_score – 0-100 integer score
+
+    Bills without a stored embedding are excluded (they will be picked up
+    on next backfill run). Falls back to [] on any error so callers can
+    gracefully degrade to keyword search.
+    """
+    prompt_emb = get_embedding(prompt)
+    if prompt_emb is None:
+        logger.warning("vector_search: could not embed prompt, returning empty.")
+        return []
+
+    try:
+        from pgvector.sqlalchemy import Vector
+        from sqlalchemy import func as sqlfunc
+        from sqlalchemy.orm import selectinload
+
+        # pgvector cosine distance operator: <=>
+        # ORDER BY distance ASC → most similar first.
+        distance_expr = LegislativeDocument.embedding.op("<=>")(prompt_emb)
+
+        rows = (
+            db.query(LegislativeDocument, distance_expr.label("distance"))
+            .options(selectinload(LegislativeDocument.subjects))
+            .filter(LegislativeDocument.embedding.isnot(None))
+            .order_by(distance_expr.asc())
+            .limit(limit * 3)  # over-fetch so we can filter by min_score
+            .all()
+        )
+
+        results = []
+        for doc, distance in rows:
+            sim = 1.0 - float(distance)  # cosine distance → similarity
+            score = _sim_to_score(sim)
+            if score < min_score:
+                continue
+            results.append({"doc": doc, "prompt_score": score})
+            if len(results) >= limit:
+                break
+
+        return results
+
+    except Exception as e:
+        logger.warning(f"vector_search failed: {e}")
+        return []

@@ -4,6 +4,7 @@ from typing import List, Optional
 from sqlalchemy import String, Integer, Boolean, DateTime, Date, ForeignKey, Table, Column, Text, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import JSONB, UUID
+from pgvector.sqlalchemy import Vector
 
 from .database import Base
 
@@ -59,6 +60,10 @@ class LegislativeDocument(Base):
     ai_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     # source_hash the AI output was generated from; lets us regenerate only on content change.
     ai_source_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
+    # pgvector embedding of bill text (title + policy_area + subjects + ai_summary).
+    # NULL until backfilled or set during sync. Used for ANN semantic search.
+    embedding: Mapped[Optional[List[float]]] = mapped_column(Vector(1536), nullable=True)
 
     # Many-to-many relationship to Subject
     subjects: Mapped[List["Subject"]] = relationship(
