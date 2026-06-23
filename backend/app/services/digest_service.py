@@ -5,7 +5,7 @@ from sqlalchemy import or_
 
 from ..models import UserProfile, LegislativeDocument, BillAction
 from ..config import settings
-from .ai_processing import expand_prompt_to_topics
+from .ai_processing import expand_prompt_to_topics, score_against_prompt
 from .semantic_scoring import semantic_score, prompt_embedding_for_digest
 
 # Minimum semantic score (0-100) for a bill to appear in a digest.
@@ -52,8 +52,6 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
         )
         .all()
     )
-    if not candidate_docs:
-        return []
 
     payloads = []
 
@@ -79,6 +77,7 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
             print(f"[DEBUG] Prompt '{prompt.prompt_text}' embedding: {'OK len={}'.format(len(emb)) if emb else 'NONE — embedding failed'}")
 
         user_digest_items = []
+        is_fallback_active = False
 
         print(f"[DEBUG] {len(candidate_docs)} candidate bills in window")
         for doc in candidate_docs:
@@ -96,7 +95,6 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
                 emb = prompt_embeddings.get(str(prompt.id))
                 if emb is None:
                     # Embedding unavailable — fall back to keyword expansion
-                    from .ai_processing import score_against_prompt
                     exp = prompt.expanded_topics or {}
                     topics = exp.get("topics", [])
                     keywords = exp.get("keywords", [])
@@ -142,6 +140,86 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
                 },
                 "matched_prompt_id": str(best_prompt.id) if best_prompt else "watched",
             })
+
+        # --- 30-Day Activity Fallback Mechanism ---
+        if not user_digest_items:
+            fallback_start_date = end_time.date() - timedelta(days=30)
+            fallback_docs = (
+                db.query(LegislativeDocument)
+                .options(selectinload(LegislativeDocument.subjects))
+                .filter(
+                    or_(
+                        LegislativeDocument.id.in_(
+                            db.query(BillAction.document_id)
+                            .filter(BillAction.action_date >= fallback_start_date)
+                            .distinct()
+                        ),
+                        LegislativeDocument.last_action_date >= fallback_start_date,
+                    )
+                )
+                .all()
+            )
+            if fallback_docs:
+                print(f"[DEBUG] Rerunning digest pipeline with 30-day window: {len(fallback_docs)} candidate bills")
+                for doc in fallback_docs:
+                    if user.scope == "priority_states" and doc.source == "congress.gov":
+                        continue
+
+                    is_review_bill = doc.source_id in user_review_bills
+
+                    best_score = -1
+                    best_prompt = None
+
+                    for prompt in matching_prompts:
+                        emb = prompt_embeddings.get(str(prompt.id))
+                        if emb is None:
+                            exp = prompt.expanded_topics or {}
+                            topics = exp.get("topics", [])
+                            keywords = exp.get("keywords", [])
+                            score = score_against_prompt(doc, topics, keywords)
+                        else:
+                            score = semantic_score(doc, emb)
+
+                        if score > best_score:
+                            best_score = score
+                            best_prompt = prompt
+
+                    qualifies = best_score >= DIGEST_SCORE_THRESHOLD or is_review_bill
+                    if not qualifies:
+                        continue
+
+                    if is_review_bill and best_score < DIGEST_SCORE_THRESHOLD:
+                        best_score = doc.relevance_score or 50
+                        explanation = "Manually added to your watched review list"
+                    else:
+                        explanation = f"Semantic relevance score: {best_score}/100"
+
+                    app_detail_url = f"{settings.FRONTEND_URL.rstrip('/')}/documents/{doc.source_id}"
+                    external_source_url = doc.source_url or f"https://www.congress.gov/bill/{doc.congress}th-congress/none"
+
+                    user_digest_items.append({
+                        "document_id": doc.source_id,
+                        "title": doc.title or "(untitled)",
+                        "policy_area": doc.policy_area or "Animals",
+                        "relevance_score": best_score,
+                        "is_review_bill": is_review_bill,
+                        "match_reason": {
+                            "matched_topics": [],
+                            "matched_keywords": [],
+                            "explanation": explanation,
+                        },
+                        "ai_summary": doc.ai_summary or "(no AI summary available)",
+                        "app_detail_url": app_detail_url,
+                        "external_source_url": external_source_url,
+                        "last_action": {
+                            "action_date": doc.last_action_date.isoformat() if doc.last_action_date else fallback_start_date.isoformat(),
+                            "text": doc.last_action_text or "(no action text available)",
+                        },
+                        "matched_prompt_id": str(best_prompt.id) if best_prompt else "watched",
+                    })
+
+                if user_digest_items:
+                    is_fallback_active = True
 
         if not user_digest_items:
             continue
@@ -196,6 +274,7 @@ def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
             "overall_summary": None,
             "items": final_items,
             "prompt_groups": prompt_groups,
+            "is_fallback_active": is_fallback_active,
         })
 
     return payloads

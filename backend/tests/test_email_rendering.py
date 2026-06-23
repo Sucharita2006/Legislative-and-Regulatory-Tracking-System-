@@ -234,6 +234,20 @@ class TestRenderDigestHtml:
         html = render_digest_html(_make_payload(frequency="daily"))
         assert "Daily" in html
 
+    def test_fallback_banner_renders_when_active(self):
+        payload = _make_payload()
+        payload["is_fallback_active"] = True
+        html = render_digest_html(payload)
+        assert "showing relevant updates from the past 30 days instead" in html
+        assert "during the daily digest" not in html
+
+    def test_fallback_banner_not_rendered_when_inactive(self):
+        payload = _make_payload()
+        payload["is_fallback_active"] = False
+        html = render_digest_html(payload)
+        assert "showing relevant updates from the past 30 days instead" not in html
+        assert "during the daily digest" in html
+
 
 class TestEmptyStateRendering:
 

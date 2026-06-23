@@ -82,10 +82,22 @@
               <p style="margin:0 0 12px; font-size:15px; color:#a1a1aa; line-height:1.6;">
                 Hi <strong style="color:#e4e4e7;">{{ recipient.email }}</strong>,
               </p>
+              {% if is_fallback_active %}
+              <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
+                     style="background-color:rgba(0,108,103,0.08); border: 1px solid #006C67; border-radius:10px; color:#7fffd4; font-family:'Segoe UI', Arial, sans-serif; margin-bottom: 20px; text-align: left;">
+                <tr>
+                  <td style="padding:14px 18px;">
+                    <p style="margin:0; font-size:13px; line-height:1.5; color:#a8f0e8;">
+                      ℹ️ <strong>Note:</strong> No legislation matching your interests was active in the last {{ period_label|lower }}. We are showing relevant updates from the past 30 days instead.
+                    </p>
+                  </td>
+                </tr>
+              </table>
+              {% endif %}
               {% if items %}
               <p style="margin:0; font-size:15px; color:#a1a1aa; line-height:1.6;">
                 Here are <strong style="color:#e4e4e7;">{{ items|length }} legislative update{% if items|length != 1 %}s{% endif %}</strong>
-                matching your tracking preferences during the {{ period_label|lower }}.
+                matching your tracking preferences{% if not is_fallback_active %} during the {{ period_label|lower }}{% endif %}.
                 {% if overall_summary %}
                 {{ overall_summary }}
                 {% endif %}

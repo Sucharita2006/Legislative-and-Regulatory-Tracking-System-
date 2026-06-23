@@ -141,31 +141,30 @@ def _call_llm(user_prompt: str) -> Dict[str, Any]:
 
 def _parse_llm_json(content: str) -> Dict[str, Any]:
     """Parse the model's JSON reply, tolerating ```json fences or surrounding prose."""
+    first_exc = None
     try:
         return json.loads(content)
-    except json.JSONDecodeError as first_exc:
-        logger.debug("Initial JSON parse failed, attempting sanitization: %s", first_exc)
+    except json.JSONDecodeError as e:
+        first_exc = e
+        logger.debug("Initial JSON parse failed, attempting sanitization: %s", e)
 
     def _sanitize_control_chars(s: str) -> str:
-        """Replace raw control characters with safe JSON escapes.
+        """Replace raw control characters with safe JSON escapes ONLY inside string values."""
+        def _escape_inside_quotes(match: re.Match) -> str:
+            val = match.group(0)
+            def _repl(m: re.Match) -> str:
+                ch = m.group(0)
+                if ch == "\n":
+                    return "\\n"
+                if ch == "\r":
+                    return "\\r"
+                if ch == "\t":
+                    return "\\t"
+                return "\\u%04x" % ord(ch)
+            sanitized_val = re.sub(r"[\x00-\x1f]", _repl, val[1:-1])
+            return f'"{sanitized_val}"'
 
-        This converts literal newlines/tabs/carriage-returns into their
-        escaped sequences ("\\n", "\\t", "\\r") and other control
-        chars into ``\\u00XX`` escapes so the JSON decoder can accept them.
-        """
-        def _repl(m: re.Match) -> str:
-            ch = m.group(0)
-            o = ord(ch)
-            if ch == "\n":
-                return "\\n"
-            if ch == "\r":
-                return "\\r"
-            if ch == "\t":
-                return "\\t"
-            return "\\u%04x" % o
-
-        # Replace all C0 control chars (0x00-0x1f)
-        return re.sub(r"[\x00-\x1f]", _repl, s)
+        return re.sub(r'"(?:[^"\\]|\\.)*"', _escape_inside_quotes, s)
 
     # Try sanitizing the whole content and parse again
     try:

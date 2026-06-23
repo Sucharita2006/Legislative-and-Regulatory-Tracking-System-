@@ -10,11 +10,28 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from app.services.digest_service import compile_digests
 from app.models import UserProfile, LegislativeDocument, BillAction, Subject, UserPrompt
 
+class MockQuery:
+    def __init__(self, result_fn):
+        self.result_fn = result_fn
+        self._annotations = {}
+
+    def __getattr__(self, name):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def all(self):
+        return self.result_fn()
+
+
 class TestDigestPipeline(unittest.TestCase):
 
     @patch("app.services.digest_service.expand_prompt_to_topics")
     @patch("app.services.digest_service.score_against_prompt")
-    def test_compile_digests(self, mock_score, mock_expand):
+    @patch("app.services.digest_service.prompt_embedding_for_digest")
+    def test_compile_digests(self, mock_emb, mock_score, mock_expand):
+        mock_emb.return_value = None
         # 1. Setup mock expansions and scores
         mock_expand.return_value = {
             "topics": ["animal welfare", "veterinary"],
@@ -31,7 +48,7 @@ class TestDigestPipeline(unittest.TestCase):
             if doc.source_id == "HR-101":
                 return 85
             elif doc.source_id == "HR-102":
-                return 40
+                return 30
             elif doc.source_id == "HR-103":
                 return 50
             elif doc.source_id == "HR-104":
@@ -125,47 +142,14 @@ class TestDigestPipeline(unittest.TestCase):
 
         # 4. Setup mock DB Session
         mock_db = MagicMock()
-        
-        # User query mock logic
         mock_query = mock_db.query
-        
-        # We need mock_query().filter().all() to return the users
-        # And mock_query().join().options().filter().distinct().all() to return candidate docs
-        mock_query_users_result = MagicMock()
-        mock_query_users_result.all.return_value = [user_daily]
-        
-        mock_query_docs_result = MagicMock()
-        mock_query_docs_result.all.return_value = [doc1, doc2, doc3, doc4]
-        
+
         def query_side_effect(model_class):
-            if model_class == UserProfile:
-                # Mock chain for user query: filter(...).options(...).all()
-                mock_filter = MagicMock()
-                mock_options = MagicMock()
-                mock_filter.options.return_value = mock_options
-                mock_options.all.return_value = [user_daily]
-                
-                mock_query_builder = MagicMock()
-                mock_query_builder.filter.return_value = mock_filter
-                return mock_query_builder
-            elif model_class == LegislativeDocument:
-                # Mock chain for documents query:
-                # db.query(LegislativeDocument).join(...).options(...).filter(...).distinct(...).all()
-                mock_join = MagicMock()
-                mock_options = MagicMock()
-                mock_filter = MagicMock()
-                mock_distinct = MagicMock()
-                
-                mock_join.return_value = mock_options
-                mock_options.options.return_value = mock_filter
-                mock_filter.filter.return_value = mock_distinct
-                mock_distinct.distinct.return_value = mock_distinct
-                mock_distinct.all.return_value = [doc1, doc2, doc3, doc4]
-                
-                mock_query_builder = MagicMock()
-                mock_query_builder.join = mock_join
-                return mock_query_builder
-            return MagicMock()
+            if model_class is UserProfile:
+                return MockQuery(lambda: [user_daily])
+            elif model_class is LegislativeDocument:
+                return MockQuery(lambda: [doc1, doc2, doc3, doc4])
+            return MockQuery(lambda: [])
 
         mock_query.side_effect = query_side_effect
 
@@ -212,6 +196,86 @@ class TestDigestPipeline(unittest.TestCase):
         
         # All candidate docs are source='congress.gov' (federal), so for scope='priority_states'
         # they should all be skipped and no payload should be compiled.
+
+    @patch("app.services.digest_service.expand_prompt_to_topics")
+    @patch("app.services.digest_service.score_against_prompt")
+    @patch("app.services.digest_service.prompt_embedding_for_digest")
+    def test_compile_digests_30_day_fallback(self, mock_emb, mock_score, mock_expand):
+        mock_emb.return_value = None
+        mock_expand.return_value = {
+            "topics": ["animal welfare"],
+            "keywords": ["dog"]
+        }
+        
+        # Mock scoring function
+        mock_score.return_value = 85
+
+        # Construct mock user
+        user = MagicMock(spec=UserProfile)
+        user.id = "user-uuid-fallback"
+        user.email = "fallback@example.com"
+        user.is_verified = True
+        user.scope = "federal"
+        user.review_bills = []
+
+        mock_prompt = MagicMock(spec=UserPrompt)
+        mock_prompt.id = "prompt-uuid-fallback"
+        mock_prompt.prompt_text = "Save the dogs"
+        mock_prompt.frequency = "daily"
+        mock_prompt.expanded_topics = {
+            "topics": ["animal welfare"],
+            "keywords": ["dog"]
+        }
+        user.prompts = [mock_prompt]
+
+        # Document for fallback
+        doc_fallback = MagicMock(spec=LegislativeDocument)
+        doc_fallback.id = "doc-uuid-fallback"
+        doc_fallback.source = "congress.gov"
+        doc_fallback.source_id = "HR-fallback"
+        doc_fallback.source_url = None
+        doc_fallback.title = "Fallback Rescue Bill"
+        doc_fallback.policy_area = "Animals"
+        doc_fallback.relevance_score = 85
+        doc_fallback.relevance_topics = ["animal welfare"]
+        doc_fallback.ai_summary = "A fallback bill."
+        doc_fallback.last_action_date = date.today() - timedelta(days=15)
+        doc_fallback.last_action_text = "Referred to committee"
+        doc_fallback.subjects = []
+
+        # Setup mock DB Session
+        mock_db = MagicMock()
+        mock_query = mock_db.query
+
+        # Track query calls to return [] on the first call, and the fallback list on subsequent calls
+        doc_query_call_count = 0
+
+        def query_side_effect(model_class):
+            nonlocal doc_query_call_count
+            if model_class is UserProfile:
+                return MockQuery(lambda: [user])
+            elif model_class is LegislativeDocument:
+                # Check first query (regular) vs second query (fallback)
+                if doc_query_call_count == 0:
+                    res = []
+                else:
+                    res = [doc_fallback]
+                doc_query_call_count += 1
+                return MockQuery(lambda: res)
+            return MockQuery(lambda: [])
+
+        mock_query.side_effect = query_side_effect
+
+        # Execute
+        payloads = compile_digests(mock_db, "daily")
+
+        # Assertions
+        self.assertEqual(len(payloads), 1)
+        payload = payloads[0]
+        self.assertEqual(payload["recipient"]["email"], "fallback@example.com")
+        self.assertTrue(payload["is_fallback_active"])
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["items"][0]["document_id"], "HR-fallback")
 
 if __name__ == "__main__":
     unittest.main()

@@ -95,6 +95,7 @@ def render_digest_html(payload: Dict[str, Any]) -> str:
         "items": items,
         "prompt_groups": prompt_groups,
         "frontend_url": settings.FRONTEND_URL.rstrip("/"),
+        "is_fallback_active": payload.get("is_fallback_active", False),
     }
 
     return template.render(**ctx)
