@@ -36,8 +36,8 @@ CACHE_PREFIX = "aldf:embed:"
 
 # Cosine similarity scale: sim in [LOW, HIGH] maps linearly to score [0, 100].
 # text-embedding-3-small typically yields 0.2–0.85 for related animal-welfare text.
-_SIM_LOW = 0.20
-_SIM_HIGH = 0.75
+_SIM_LOW = 0.15
+_SIM_HIGH = 0.65
 
 
 # ---------------------------------------------------------------------------

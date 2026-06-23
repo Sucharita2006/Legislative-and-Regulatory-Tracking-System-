@@ -9,7 +9,7 @@ from .ai_processing import expand_prompt_to_topics
 from .semantic_scoring import semantic_score, prompt_embedding_for_digest
 
 # Minimum semantic score (0-100) for a bill to appear in a digest.
-DIGEST_SCORE_THRESHOLD = 50
+DIGEST_SCORE_THRESHOLD = 40
 
 
 def compile_digests(db: Session, frequency: str) -> List[Dict[str, Any]]:
