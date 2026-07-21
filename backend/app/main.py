@@ -1,0 +1,2218 @@
+from __future__ import annotations
+from fastapi import FastAPI, Depends, BackgroundTasks, HTTPException, Header, Request
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import or_, and_, func
+from typing import Dict, Any, List, Optional
+import csv
+import os
+import re
+from apscheduler.schedulers.background import BackgroundScheduler
+from .services.daily_sync import process_daily_sync
+from .database import SessionLocal
+import io
+import json
+from datetime import date
+
+from .database import get_db
+from .models import LegislativeDocument, SyncLog, Base, Subject, UserProfile, UserPrompt, BillAction, BillTag
+from .services.sync import seed_animal_subjects, run_historical_backfill
+from .services.matching import get_current_stage, SUBJECT_CATEGORIES
+from .services.ai_processing import process_bill_ai, expand_prompt_to_topics, score_against_prompt
+from .services.congress_api import CongressAPIClient
+from .services.auth import require_internal_key, require_service_token, require_service_jwt_for_email
+from .services.rate_limit import enforce_rate_limit
+from .services.job_lock import try_acquire_lock, release_lock
+from .config import settings
+
+app = FastAPI(
+    title="Animal Legislation Tracking System - Congress.gov Backfill Module",
+    version="1.0.0"
+)
+
+_cors_origins = [o.strip() for o in os.environ.get(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
+).split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+def startup_event():
+    from datetime import datetime
+    db = next(get_db())
+    try:
+        seeded = seed_animal_subjects(db)
+        print(f"Startup: Seeded {seeded} new animal subjects.")
+        # Mark any sync logs stuck in 'running' as 'interrupted' (server restarted mid-run)
+        stuck = db.query(SyncLog).filter(SyncLog.status == "running").all()
+        for log in stuck:
+            log.status = "interrupted"
+            log.end_time = datetime.now()
+            log.error_message = "Server restarted while sync was in progress."
+        if stuck:
+            db.commit()
+            print(f"Startup: Marked {len(stuck)} interrupted sync log(s).")
+    finally:
+        db.close()
+    # Start APScheduler for daily sync at midnight UTC
+    import pytz
+    scheduler = BackgroundScheduler(timezone=pytz.utc)
+    scheduler.add_job(process_daily_sync, "cron", hour=0, minute=0)
+    scheduler.start()
+
+
+def extract_sponsor_info(api_raw: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Helper to dynamically extract sponsor details from raw api_raw response."""
+    if not api_raw:
+        return None, None, None
+    
+    # Check single sponsor field first
+    sponsor_data = api_raw.get("sponsor")
+    if not sponsor_data and api_raw.get("sponsors"):
+        sponsors_list = api_raw.get("sponsors")
+        if sponsors_list:
+            sponsor_data = sponsors_list[0]
+            
+    if not sponsor_data:
+        return None, None, None
+        
+    sponsor_name = sponsor_data.get("fullName") or f"{sponsor_data.get('firstName', '')} {sponsor_data.get('lastName', '')}".strip() or None
+    sponsor_party = sponsor_data.get("party")
+    sponsor_state = sponsor_data.get("state")
+    return sponsor_name, sponsor_party, sponsor_state
+
+@app.get("/health")
+def health_check(db: Session = Depends(get_db)):
+    """
+    Health check endpoint verifying connection to PostgreSQL database.
+    """
+    try:
+        # Check database connection
+        db.execute(Base.metadata.tables["animal_subjects"].select().limit(1))
+        return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "database": str(e)}
+
+@app.get("/congress/current")
+def get_current_congress_info():
+    """
+    Return the current Congress number, its convening date, and a list of
+    available recent Congresses for frontend dropdowns.
+    """
+    from .services.daily_sync import get_current_congress, get_congress_start_date
+    current = get_current_congress()
+    start_date = get_congress_start_date(current)
+    
+    # Provide the last 5 Congresses (approx 10 years) for historical search
+    available = [current - i for i in range(5)]
+    
+    return {
+        "current_congress": current,
+        "session_start": start_date.isoformat(),
+        "available": available
+    }
+
+def _bg_backfill(congress: int, max_bills: Optional[int]):
+    """Worker function for running backfill in background."""
+    db = next(get_db())
+    try:
+        print(f"Starting background historical backfill for Congress {congress}...")
+        run_historical_backfill(db, congress, max_bills)
+        print(f"Background historical backfill for Congress {congress} finished.")
+        try:
+            from .services.cache import clear_cache
+            clear_cache()
+        except Exception as e:
+            print(f"Failed to clear cache after backfill: {e}")
+    except Exception as e:
+        print(f"Background backfill for Congress {congress} failed: {e}")
+    finally:
+        db.close()
+        release_lock(f"sync_backfill:{congress}")
+
+@app.post("/sync/backfill/{congress}")
+def trigger_backfill(
+    congress: int,
+    background_tasks: BackgroundTasks,
+    limit_bills: Optional[int] = None,
+    db: Session = Depends(get_db),
+    _auth: None = Depends(require_internal_key),
+):
+    """
+    Triggers historical sync for a given Congress in a background task.
+    """
+    if congress < 1 or congress > 200:
+        raise HTTPException(status_code=400, detail="Invalid congress number")
+
+    if not try_acquire_lock(f"sync_backfill:{congress}"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"A historical backfill for Congress {congress} is already in progress.",
+        )
+
+    # Add backfill to background tasks
+    background_tasks.add_task(_bg_backfill, congress, limit_bills)
+
+    return {
+        "message": f"Historical backfill for Congress {congress} started in background.",
+        "limit_bills": limit_bills
+    }
+
+@app.get("/sync/logs", response_model=List[Dict[str, Any]])
+def get_sync_logs(db: Session = Depends(get_db)):
+    """
+    Retrieves the most recent sync logs.
+    """
+    logs = db.query(SyncLog).order_by(SyncLog.start_time.desc()).limit(20).all()
+    return [
+        {
+            "id": str(log.id),
+            "sync_type": log.sync_type,
+            "status": log.status,
+            "records_processed": log.records_processed,
+            "start_time": log.start_time.isoformat(),
+            "end_time": log.end_time.isoformat() if log.end_time else None,
+            "error_message": log.error_message
+        }
+        for log in logs
+    ]
+
+@app.get("/documents", response_model=List[Dict[str, Any]])
+def get_documents(db: Session = Depends(get_db)):
+    """
+    Retrieves the most recently ingested animal legislative documents.
+    """
+    docs = db.query(LegislativeDocument).order_by(LegislativeDocument.ingested_at.desc()).limit(50).all()
+    return [
+        {
+            "id": str(doc.id),
+            "source_id": doc.source_id,
+            "title": doc.title,
+            "congress": doc.congress,
+            "bill_type": doc.bill_type,
+            "bill_number": doc.bill_number,
+            "introduced_date": doc.introduced_date.isoformat() if doc.introduced_date else None,
+            "policy_area": doc.policy_area,
+            "current_stage": get_current_stage(doc.last_action_text),
+            "last_action_text": doc.last_action_text,
+            "ingested_at": doc.ingested_at.isoformat(),
+            "subjects": [s.name for s in doc.subjects]
+        }
+        for doc in docs
+    ]
+
+
+@app.get("/documents/search")
+def search_documents(
+    keyword: Optional[str] = None,
+    subject: Optional[str] = None,
+    policy_area: Optional[str] = None,
+    bill_type: Optional[str] = None,
+    congress: Optional[int] = None,
+    from_action_date: Optional[date] = None,
+    to_action_date: Optional[date] = None,
+    sort_by: str = "introduced_date",
+    order: str = "desc",
+    limit: int = 20,
+    offset: int = 0,
+    user_prompt: Optional[str] = None,
+    user_email: Optional[str] = None,
+    min_score: Optional[int] = None,
+    tag: Optional[str] = None,
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    """
+    Search and filter ingested legislative documents.
+    """
+    allowed_sort_fields = {
+        "introduced_date": LegislativeDocument.introduced_date,
+        "last_action_date": LegislativeDocument.last_action_date,
+        "source_id": LegislativeDocument.source_id,
+        "ingested_at": LegislativeDocument.ingested_at
+    }
+    
+    if sort_by not in allowed_sort_fields:
+        raise HTTPException(status_code=400, detail=f"Invalid sort field: {sort_by}")
+
+    # --- Bill number pre-pass: direct lookup ---
+    target_prompt = (user_prompt or "").strip() or (keyword or "").strip()
+    if target_prompt:
+        bill_parsed = _parse_bill_number_query(target_prompt)
+        if bill_parsed:
+            bill_type_parsed, bill_number_parsed, congress_parsed = bill_parsed
+            bill_docs = []
+            if congress_parsed and bill_type_parsed:
+                source_id_candidate = f"{congress_parsed}-{bill_type_parsed.upper()}-{bill_number_parsed}"
+                direct = (
+                    db.query(LegislativeDocument)
+                    .options(selectinload(LegislativeDocument.subjects))
+                    .filter(LegislativeDocument.source_id == source_id_candidate)
+                    .first()
+                )
+                if direct:
+                    bill_docs = [direct]
+            if not bill_docs:
+                bill_q = db.query(LegislativeDocument).options(selectinload(LegislativeDocument.subjects))
+                if bill_type_parsed:
+                    bill_q = bill_q.filter(func.upper(LegislativeDocument.bill_type) == bill_type_parsed.upper())
+                bill_q = bill_q.filter(LegislativeDocument.bill_number == bill_number_parsed)
+                if congress_parsed:
+                    bill_q = bill_q.filter(LegislativeDocument.congress == int(congress_parsed))
+                bill_docs = bill_q.all()
+            
+            if bill_docs:
+                formatted_results = []
+                for doc in bill_docs:
+                    sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+                    formatted_results.append({
+                        "id": str(doc.id),
+                        "source_id": doc.source_id,
+                        "title": doc.title,
+                        "congress": doc.congress,
+                        "bill_type": doc.bill_type,
+                        "bill_number": doc.bill_number,
+                        "introduced_date": doc.introduced_date.isoformat() if doc.introduced_date else None,
+                        "origin_chamber": doc.origin_chamber,
+                        "policy_area": doc.policy_area,
+                        "current_stage": get_current_stage(doc.last_action_text),
+                        "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+                        "last_action_text": doc.last_action_text,
+                        "update_date": doc.update_date.isoformat() if doc.update_date else None,
+                        "update_date_incl_text": doc.update_date_incl_text.isoformat() if doc.update_date_incl_text else None,
+                        "sponsor_name": sp_name,
+                        "sponsor_party": sp_party,
+                        "sponsor_state": sp_state,
+                        "source_url": doc.source_url,
+                        "ingested_at": doc.ingested_at.isoformat(),
+                        "updated_at": doc.updated_at.isoformat(),
+                        "subjects": [s.name for s in doc.subjects],
+                        "relevance_score": doc.relevance_score,
+                        "prompt_score": doc.relevance_score if doc.relevance_score is not None else 100,
+                        "relevance_topics": doc.relevance_topics,
+                        "ai_summary": doc.ai_summary,
+                    })
+                mock_expansion = {
+                    "topics": [],
+                    "keywords": [bill_type_parsed.lower() if bill_type_parsed else "", bill_number_parsed],
+                    "inferred_filters": {
+                        "subject": None,
+                        "origin_chamber": None,
+                        "bill_type": bill_type_parsed.upper() if bill_type_parsed else None,
+                        "date_from": None,
+                        "date_to": None,
+                        "state": None,
+                    }
+                }
+                return {
+                    "total": len(formatted_results),
+                    "results": formatted_results,
+                    "prompt_expansion": mock_expansion,
+                }
+
+    # Cache lookup
+    from .services.cache import get_cache, set_cache, make_search_key
+    params = {
+        "keyword": keyword, "subject": subject, "policy_area": policy_area,
+        "bill_type": bill_type, "congress": congress, 
+        "from_action_date": from_action_date.isoformat() if from_action_date else None,
+        "to_action_date": to_action_date.isoformat() if to_action_date else None, 
+        "sort_by": sort_by, "order": order, "limit": limit, "offset": offset,
+        "user_prompt": user_prompt, "user_email": user_email, "min_score": min_score,
+        "tag": tag,
+    }
+    cache_key = make_search_key(params)
+    cached_res = get_cache(cache_key)
+    if cached_res is not None:
+        return cached_res
+         
+    # Expand user prompt once, then use for scoring + filtering
+    prompt_expansion = None
+    expanded_topics = []
+    expanded_keywords = []
+    if user_prompt and user_prompt.strip():
+        enforce_rate_limit(
+            request, scope="documents_search_prompt",
+            limit=settings.RATE_LIMIT_SEARCH_PER_MINUTE, user_email=user_email,
+        )
+        prompt_expansion = expand_prompt_to_topics(user_prompt.strip(), db=db, user_email=user_email)
+        expanded_topics = prompt_expansion.get("topics", [])
+        expanded_keywords = prompt_expansion.get("keywords", [])
+
+    query = db.query(LegislativeDocument).options(selectinload(LegislativeDocument.subjects))
+    
+    if keyword:
+        query = query.filter(
+            or_(
+                LegislativeDocument.title.ilike(f"%{keyword}%"),
+                LegislativeDocument.last_action_text.ilike(f"%{keyword}%"),
+                LegislativeDocument.source_id.ilike(f"%{keyword}%")
+            )
+        )
+    if subject:
+        query = query.join(LegislativeDocument.subjects).filter(Subject.name.ilike(subject))
+    if policy_area:
+        query = query.filter(LegislativeDocument.policy_area.ilike(policy_area))
+    if bill_type:
+        query = query.filter(LegislativeDocument.bill_type.ilike(bill_type))
+    if congress is not None:
+        query = query.filter(LegislativeDocument.congress == congress)
+    if from_action_date:
+        query = query.filter(LegislativeDocument.last_action_date >= from_action_date)
+    if to_action_date:
+        query = query.filter(LegislativeDocument.last_action_date <= to_action_date)
+
+    # Tags are per-user, so filtering by tag requires knowing which user's tags to match.
+    user_profile_for_tags = None
+    if user_email:
+        user_profile_for_tags = db.query(UserProfile).filter(func.lower(UserProfile.email) == user_email.lower()).first()
+
+    if tag:
+        if not user_profile_for_tags:
+            raise HTTPException(status_code=400, detail="A valid user_email is required to filter by tag")
+        tagged_doc_ids = db.query(BillTag.document_id).filter(
+            BillTag.user_id == user_profile_for_tags.id,
+            BillTag.tag_name == tag.strip().lower(),
+        )
+        query = query.filter(LegislativeDocument.id.in_(tagged_doc_ids))
+
+    # When a user prompt is active, filter query to only match semantic hits or keyword fallback hits
+    vector_score_map: Dict[Any, int] = {}
+    if prompt_expansion and user_prompt:
+        from .services.semantic_scoring import vector_search
+        vector_hits = vector_search(user_prompt, db, limit=limit * 5, min_score=0)
+        vector_doc_ids = [h["doc"].id for h in vector_hits] if vector_hits else []
+        if vector_hits:
+            vector_score_map = {h["doc"].id: h["prompt_score"] for h in vector_hits}
+
+        keyword_clauses = []
+        if expanded_keywords:
+            for kw in expanded_keywords:
+                keyword_clauses.append(LegislativeDocument.title.ilike(f"%{kw}%"))
+                keyword_clauses.append(LegislativeDocument.source_id.ilike(f"%{kw}%"))
+
+        if vector_doc_ids and keyword_clauses:
+            query = query.filter(
+                or_(
+                    LegislativeDocument.id.in_(vector_doc_ids),
+                    and_(
+                        LegislativeDocument.embedding == None,
+                        or_(*keyword_clauses)
+                    )
+                )
+            )
+        elif vector_doc_ids:
+            query = query.filter(LegislativeDocument.id.in_(vector_doc_ids))
+        elif keyword_clauses:
+            query = query.filter(
+                and_(
+                    LegislativeDocument.embedding == None,
+                    or_(*keyword_clauses)
+                )
+            )
+
+    total = query.distinct().count()
+
+    sort_col = allowed_sort_fields[sort_by]
+    if order.lower() == "asc":
+        query = query.order_by(sort_col.asc(), LegislativeDocument.id)
+    else:
+        query = query.order_by(sort_col.desc(), LegislativeDocument.id)
+
+    if prompt_expansion:
+        results = query.distinct().all()
+    else:
+        results = query.distinct().offset(offset).limit(limit).all()
+
+    tags_by_doc: Dict[Any, List[str]] = {}
+    if user_profile_for_tags:
+        tag_rows = db.query(BillTag.document_id, BillTag.tag_name).filter(
+            BillTag.user_id == user_profile_for_tags.id
+        ).all()
+        for doc_id, tag_name in tag_rows:
+            tags_by_doc.setdefault(doc_id, []).append(tag_name)
+
+    formatted_results = []
+    for doc in results:
+        sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+
+        if prompt_expansion:
+            if doc.id in vector_score_map:
+                prompt_score = vector_score_map[doc.id]
+            elif doc.embedding is None:
+                # Fall back to keyword scoring if doc lacks embedding
+                prompt_score = score_against_prompt(
+                    doc,
+                    expanded_topics,
+                    expanded_keywords,
+                    prompt_text=user_prompt
+                )
+            else:
+                # Has embedding, but was not in the top vector results (low similarity)
+                prompt_score = 0
+        else:
+            prompt_score = doc.relevance_score
+
+        # Apply min_score filter using prompt_score when a prompt is active, else relevance_score
+        effective_score = prompt_score if prompt_expansion else (doc.relevance_score or 0)
+        if min_score is not None and effective_score < min_score:
+            continue
+
+        formatted_results.append({
+            "id": str(doc.id),
+            "source_id": doc.source_id,
+            "title": doc.title,
+            "congress": doc.congress,
+            "bill_type": doc.bill_type,
+            "bill_number": doc.bill_number,
+            "introduced_date": doc.introduced_date.isoformat() if doc.introduced_date else None,
+            "origin_chamber": doc.origin_chamber,
+            "policy_area": doc.policy_area,
+            "current_stage": get_current_stage(doc.last_action_text),
+            "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+            "last_action_text": doc.last_action_text,
+            "update_date": doc.update_date.isoformat() if doc.update_date else None,
+            "update_date_incl_text": doc.update_date_incl_text.isoformat() if doc.update_date_incl_text else None,
+            "sponsor_name": sp_name,
+            "sponsor_party": sp_party,
+            "sponsor_state": sp_state,
+            "source_url": doc.source_url,
+            "ingested_at": doc.ingested_at.isoformat(),
+            "updated_at": doc.updated_at.isoformat(),
+            "subjects": [s.name for s in doc.subjects],
+            "relevance_score": doc.relevance_score,
+            "prompt_score": prompt_score,
+            "relevance_topics": doc.relevance_topics,
+            "ai_summary": doc.ai_summary,
+            "tags": tags_by_doc.get(doc.id, []),
+        })
+
+    # Re-sort by prompt_score desc when a prompt is active, then paginate
+    if prompt_expansion:
+        formatted_results.sort(key=lambda r: r["prompt_score"], reverse=True)
+        formatted_results = formatted_results[offset : offset + limit]
+    else:
+        formatted_results = formatted_results[:limit]
+
+    res = {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "prompt_expansion": prompt_expansion,
+        "results": formatted_results
+    }
+    try:
+        set_cache(cache_key, res, expire=300)
+    except Exception as e:
+        pass
+    return res
+
+
+@app.get("/documents/{source_id}/actions")
+def get_document_actions(source_id: str, db: Session = Depends(get_db)):
+    """Return action history from DB cache; fall back to Congress.gov if none stored."""
+    doc = db.query(LegislativeDocument).filter(LegislativeDocument.source_id == source_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    stored = (
+        db.query(BillAction)
+        .filter(BillAction.document_id == doc.id)
+        .order_by(BillAction.action_date.desc())
+        .all()
+    )
+    if stored:
+        seen: set = set()
+        actions = []
+        for a in stored:
+            key = (a.action_date.isoformat(), a.text.strip())
+            if key in seen:
+                continue
+            seen.add(key)
+            actions.append({
+                "actionDate": a.action_date.isoformat(),
+                "text": a.text,
+                "actionCode": a.action_code,
+                "sourceSystem": {"name": a.source_system_name, "code": a.source_system_code},
+            })
+        return {"actions": actions}
+
+    # Nothing cached — fetch live and persist
+    try:
+        client = CongressAPIClient()
+        result = client.fetch_bill_actions(doc.congress, doc.bill_type, doc.bill_number)
+        actions = result.get("actions", [])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch actions from Congress.gov: {e}")
+
+    if actions:
+        for act in actions:
+            action_date_str = act.get("actionDate")
+            try:
+                action_date = date.fromisoformat(action_date_str) if action_date_str else None
+            except ValueError:
+                action_date = None
+            if not action_date or not act.get("text"):
+                continue
+            db.add(BillAction(
+                document_id=doc.id,
+                action_code=act.get("actionCode"),
+                action_date=action_date,
+                text=act["text"],
+                action_type=act.get("type"),
+                source_system_code=act.get("sourceSystem", {}).get("code"),
+                source_system_name=act.get("sourceSystem", {}).get("name"),
+            ))
+        latest = actions[0]
+        action_date_str = latest.get("actionDate")
+        action_text = latest.get("text")
+        try:
+            new_date = date.fromisoformat(action_date_str) if action_date_str else None
+        except ValueError:
+            new_date = None
+        if new_date and action_text and (new_date != doc.last_action_date or action_text != doc.last_action_text):
+            doc.last_action_date = new_date
+            doc.last_action_text = action_text
+        db.commit()
+
+    return {"actions": actions}
+
+
+@app.get("/documents/{source_id}")
+def get_document_details(source_id: str, db: Session = Depends(get_db)):
+    """
+    Retrieve comprehensive details for a specific legislative document.
+    """
+    doc = db.query(LegislativeDocument).filter(LegislativeDocument.source_id == source_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+    return {
+        "id": str(doc.id),
+        "source_id": doc.source_id,
+        "title": doc.title,
+        "congress": doc.congress,
+        "bill_type": doc.bill_type,
+        "bill_number": doc.bill_number,
+        "introduced_date": doc.introduced_date.isoformat() if doc.introduced_date else None,
+        "origin_chamber": doc.origin_chamber,
+        "policy_area": doc.policy_area,
+        "current_stage": get_current_stage(doc.last_action_text),
+        "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+        "last_action_text": doc.last_action_text,
+        "update_date": doc.update_date.isoformat() if doc.update_date else None,
+        "update_date_incl_text": doc.update_date_incl_text.isoformat() if doc.update_date_incl_text else None,
+        "sponsor_name": sp_name,
+        "sponsor_party": sp_party,
+        "sponsor_state": sp_state,
+        "source_url": doc.source_url,
+        "ingested_at": doc.ingested_at.isoformat(),
+        "updated_at": doc.updated_at.isoformat(),
+        "source_hash": doc.source_hash,
+        "subjects": [s.name for s in doc.subjects],
+        "official_summary": doc.official_summary,
+        "relevance_score": doc.relevance_score,
+        "relevance_topics": doc.relevance_topics,
+        "relevance_rationale": doc.relevance_rationale,
+        "ai_summary": doc.ai_summary,
+        "ai_generated_at": doc.ai_generated_at.isoformat() if doc.ai_generated_at else None,
+        "api_raw": doc.api_raw
+    }
+
+
+@app.post("/ai/process/{source_id}")
+def run_ai_for_bill(
+    source_id: str,
+    db: Session = Depends(get_db),
+    _auth: None = Depends(require_internal_key),
+):
+    """Trigger AI scoring and summary generation for a single bill."""
+    doc = db.query(LegislativeDocument).filter(LegislativeDocument.source_id == source_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    process_bill_ai(doc, db=db)
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except Exception as e:
+        pass
+    return {
+        "source_id": doc.source_id,
+        "relevance_score": doc.relevance_score,
+        "relevance_topics": doc.relevance_topics,
+        "relevance_rationale": doc.relevance_rationale,
+        "ai_summary": doc.ai_summary,
+        "ai_generated_at": doc.ai_generated_at.isoformat() if doc.ai_generated_at else None,
+    }
+
+
+def _bg_ai_backfill(force: bool):
+    """Background worker: run AI pipeline on all bills missing AI output (or all if force=True)."""
+    db = SessionLocal()
+    try:
+        query = db.query(LegislativeDocument)
+        if not force:
+            query = query.filter(LegislativeDocument.ai_generated_at == None)
+        docs = query.all()
+        total = len(docs)
+        print(f"AI backfill: processing {total} bills (force={force}).")
+        for i, doc in enumerate(docs, 1):
+            process_bill_ai(doc, db=db)
+            if i % 10 == 0:
+                print(f"AI backfill progress: {i}/{total}")
+        print(f"AI backfill complete: {total} bills processed.")
+        try:
+            from .services.cache import clear_cache
+            clear_cache()
+        except Exception as e:
+            pass
+    except Exception as e:
+        print(f"AI backfill failed: {e}")
+    finally:
+        db.close()
+        release_lock("ai_backfill")
+
+
+_BILL_NUMBER_RE = re.compile(
+    r"""
+    (?:
+        # source_id format: 119-HR-65
+        (\d{3})-([A-Za-z]+)-(\d+)
+    |
+        # standard: HR 65, H.R.65, S.1234, HJRES 4, SCONRES 12, etc.
+        (H\.?R\.?|S\.?|H\.?J\.?RES\.?|S\.?J\.?RES\.?|H\.?CON\.?RES\.?|S\.?CON\.?RES\.?|H\.?RES\.?|S\.?RES\.?)
+        [\s.\-]*(\d+)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_BILL_TYPE_ALIASES = {
+    "HR": "HR", "H.R": "HR", "H.R.": "HR",
+    "S": "S", "S.": "S",
+    "HJRES": "HJRES", "H.J.RES": "HJRES", "H.J.RES.": "HJRES", "HJRES.": "HJRES",
+    "SJRES": "SJRES", "S.J.RES": "SJRES", "S.J.RES.": "SJRES",
+    "HCONRES": "HCONRES", "H.CON.RES": "HCONRES", "H.CON.RES.": "HCONRES",
+    "SCONRES": "SCONRES", "S.CON.RES": "SCONRES", "S.CON.RES.": "SCONRES",
+    "HRES": "HRES", "H.RES": "HRES", "H.RES.": "HRES",
+    "SRES": "SRES", "S.RES": "SRES", "S.RES.": "SRES",
+}
+
+
+def _parse_bill_number_query(prompt: str):
+    """Return (bill_type, bill_number, congress_or_None) if prompt looks like a bill number, else None."""
+    p_clean = prompt.strip()
+    if p_clean.isdigit():
+        return None, p_clean, None
+    m = _BILL_NUMBER_RE.search(p_clean)
+    if not m:
+        return None
+    if m.group(1):  # source_id format
+        congress = m.group(1)
+        raw_type = m.group(2).upper()
+        number = m.group(3)
+    else:
+        congress = None
+        raw_type = re.sub(r'\.', '', m.group(4).upper())
+        number = m.group(5)
+    bill_type = _BILL_TYPE_ALIASES.get(raw_type, raw_type)
+    return bill_type, number, congress
+
+
+@app.post("/search/live")
+def live_search(
+    body: Dict[str, Any],
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Search bills by semantic similarity using pgvector ANN search.
+
+    Primary path: vector_search() does a single ORDER BY <=> query — no keyword
+    pre-filtering, so semantically relevant bills are never excluded by missing
+    topic tags.
+
+    When a date filter is provided the ANN results are intersected with bills
+    that had an action on that date.
+
+    Falls back to keyword/topic scoring if embeddings are unavailable.
+    """
+    from .models import BillAction
+    from .services.ai_processing import expand_prompt_to_topics, score_against_prompt
+    from .services.semantic_scoring import vector_search
+    from datetime import date as date_type
+
+    prompt = (body.get("prompt") or "").strip()
+    search_date = (body.get("date") or "").strip() or None
+    user_email = (body.get("user_email") or "").strip() or None
+
+    if not prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    parsed_date = None
+    if search_date:
+        try:
+            parsed_date = date_type.fromisoformat(search_date)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="date must be in YYYY-MM-DD format")
+
+    # Cache lookup
+    from .services.cache import get_cache, set_cache, make_live_search_key
+    cache_key = make_live_search_key({"prompt": prompt, "date": search_date, "user_email": user_email})
+    cached_res = get_cache(cache_key)
+    if cached_res is not None:
+        return cached_res
+
+    # --- Bill number pre-pass: direct lookup, skip embeddings ---
+    bill_parsed = _parse_bill_number_query(prompt)
+    if bill_parsed:
+        bill_type, bill_number, congress = bill_parsed
+        # If we have a congress number, try direct source_id lookup first (most reliable)
+        bill_docs = []
+        if congress and bill_type:
+            source_id_candidate = f"{congress}-{bill_type.upper()}-{bill_number}"
+            direct = (
+                db.query(LegislativeDocument)
+                .options(selectinload(LegislativeDocument.subjects))
+                .filter(LegislativeDocument.source_id == source_id_candidate)
+                .first()
+            )
+            if direct:
+                bill_docs = [direct]
+        if not bill_docs:
+            bill_q = db.query(LegislativeDocument).options(selectinload(LegislativeDocument.subjects))
+            if bill_type:
+                bill_q = bill_q.filter(func.upper(LegislativeDocument.bill_type) == bill_type.upper())
+            bill_q = bill_q.filter(LegislativeDocument.bill_number == bill_number)
+            if congress:
+                bill_q = bill_q.filter(LegislativeDocument.congress == int(congress))
+            bill_docs = bill_q.all()
+        if bill_docs:
+            results = []
+            for doc in bill_docs:
+                sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+                action_date = doc.last_action_date.isoformat() if doc.last_action_date else None
+                action_text = doc.last_action_text
+                if parsed_date:
+                    from .models import BillAction as _BA
+                    act = (
+                        db.query(_BA)
+                        .filter(_BA.document_id == doc.id, _BA.action_date == parsed_date)
+                        .first()
+                    )
+                    if not act:
+                        continue
+                    action_date = act.action_date.isoformat()
+                    action_text = act.text
+                results.append({
+                    "source_id": doc.source_id,
+                    "title": doc.title,
+                    "bill_type": doc.bill_type,
+                    "bill_number": doc.bill_number,
+                    "origin_chamber": doc.origin_chamber,
+                    "policy_area": doc.policy_area,
+                    "action_date": action_date,
+                    "action_text": action_text,
+                    "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+                    "last_action_text": doc.last_action_text,
+                    "subjects": [s.name for s in doc.subjects],
+                    "prompt_score": doc.relevance_score if doc.relevance_score is not None else 100,
+                    "relevance_score": doc.relevance_score,
+                    "ai_summary": doc.ai_summary,
+                    "source_url": doc.source_url,
+                    "current_stage": get_current_stage(doc.last_action_text),
+                    "sponsor_name": sp_name,
+                    "sponsor_party": sp_party,
+                    "sponsor_state": sp_state,
+                })
+            if results:
+                res = {"date": search_date, "search_mode": "bill_number", "total": len(results), "results": results}
+                try:
+                    set_cache(cache_key, res, expire=300)
+                except Exception:
+                    pass
+                return res
+
+    enforce_rate_limit(
+        request, scope="search_live",
+        limit=settings.RATE_LIMIT_SEARCH_PER_MINUTE, user_email=user_email,
+    )
+
+    expansion = expand_prompt_to_topics(prompt, db=db, user_email=user_email)
+
+    # --- Primary path: pgvector ANN ---
+    vector_hits = vector_search(prompt, db, limit=40, min_score=10)
+
+    if vector_hits:
+        # Build a map from doc id → score for fast lookup
+        score_by_id = {h["doc"].id: h["prompt_score"] for h in vector_hits}
+        docs_map = {h["doc"].id: h["doc"] for h in vector_hits}
+
+        if parsed_date:
+            # Intersect ANN results with bills that had an action on the given date
+            action_rows = (
+                db.query(BillAction.document_id, BillAction.action_date, BillAction.text)
+                .filter(
+                    BillAction.action_date == parsed_date,
+                    BillAction.document_id.in_(list(docs_map.keys()))
+                )
+                .distinct(BillAction.document_id)
+                .all()
+            )
+            docs_to_format = [
+                (docs_map[r.document_id], r.action_date.isoformat(), r.text)
+                for r in action_rows
+                if r.document_id in docs_map
+            ]
+        else:
+            docs_to_format = [
+                (h["doc"], h["doc"].last_action_date.isoformat() if h["doc"].last_action_date else None, h["doc"].last_action_text)
+                for h in vector_hits
+            ]
+
+        results = []
+        for doc, action_date, action_text in docs_to_format:
+            sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+            results.append({
+                "source_id": doc.source_id,
+                "title": doc.title,
+                "bill_type": doc.bill_type,
+                "bill_number": doc.bill_number,
+                "origin_chamber": doc.origin_chamber,
+                "policy_area": doc.policy_area,
+                "action_date": action_date,
+                "action_text": action_text,
+                "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+                "last_action_text": doc.last_action_text,
+                "subjects": [s.name for s in doc.subjects],
+                "prompt_score": score_by_id[doc.id],
+                "relevance_score": doc.relevance_score,
+                "ai_summary": doc.ai_summary,
+                "source_url": doc.source_url,
+                "current_stage": get_current_stage(doc.last_action_text),
+                "sponsor_name": sp_name,
+                "sponsor_party": sp_party,
+                "sponsor_state": sp_state,
+            })
+
+        results.sort(key=lambda r: r["prompt_score"], reverse=True)
+        res = {
+            "date": search_date,
+            "prompt_expansion": expansion,
+            "total": len(results),
+            "results": results,
+        }
+        try:
+            set_cache(cache_key, res, expire=300)
+        except Exception:
+            pass
+        return res
+
+    # --- Fallback: keyword/topic pre-filter (used when no embeddings stored yet) ---
+    topics = expansion.get("topics", [])
+    keywords = expansion.get("keywords", [])
+
+    from sqlalchemy import or_, cast
+    from sqlalchemy.dialects.postgresql import JSONB, ARRAY as PG_ARRAY
+    from sqlalchemy.types import Text
+
+    candidate_filters = []
+    if topics:
+        candidate_filters.append(
+            LegislativeDocument.relevance_topics.cast(JSONB).op("?|")(
+                cast(topics, PG_ARRAY(Text))
+            )
+        )
+    for kw in keywords:
+        candidate_filters.append(LegislativeDocument.title.ilike(f"%{kw}%"))
+        candidate_filters.append(LegislativeDocument.policy_area.ilike(f"%{kw}%"))
+        candidate_filters.append(LegislativeDocument.bill_number.ilike(f"%{kw}%"))
+        candidate_filters.append(LegislativeDocument.source_id.ilike(f"%{kw}%"))
+
+    if parsed_date:
+        action_subq = (
+            db.query(BillAction.document_id, BillAction.action_date, BillAction.text)
+            .filter(BillAction.action_date == parsed_date)
+            .distinct(BillAction.document_id)
+            .subquery()
+        )
+        base_q = (
+            db.query(LegislativeDocument, action_subq.c.action_date, action_subq.c.text)
+            .join(action_subq, LegislativeDocument.id == action_subq.c.document_id)
+            .options(selectinload(LegislativeDocument.subjects))
+        )
+        if candidate_filters:
+            base_q = base_q.filter(or_(*candidate_filters))
+        rows = base_q.all()
+        docs_to_score = [(doc, ad.isoformat(), at) for doc, ad, at in rows]
+    else:
+        if not candidate_filters:
+            return {"date": None, "prompt_expansion": expansion, "total": 0, "results": []}
+        docs = (
+            db.query(LegislativeDocument)
+            .options(selectinload(LegislativeDocument.subjects))
+            .filter(or_(*candidate_filters))
+            .all()
+        )
+        docs_to_score = [
+            (doc, doc.last_action_date.isoformat() if doc.last_action_date else None, doc.last_action_text)
+            for doc in docs
+        ]
+
+    results = []
+    for doc, action_date, action_text in docs_to_score:
+        prompt_score = score_against_prompt(doc, topics, keywords, prompt_text=prompt)
+        if prompt_score == 0:
+            continue
+        sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+        results.append({
+            "source_id": doc.source_id,
+            "title": doc.title,
+            "bill_type": doc.bill_type,
+            "bill_number": doc.bill_number,
+            "origin_chamber": doc.origin_chamber,
+            "policy_area": doc.policy_area,
+            "action_date": action_date,
+            "action_text": action_text,
+            "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+            "last_action_text": doc.last_action_text,
+            "subjects": [s.name for s in doc.subjects],
+            "prompt_score": prompt_score,
+            "relevance_score": doc.relevance_score,
+            "ai_summary": doc.ai_summary,
+            "source_url": doc.source_url,
+            "current_stage": get_current_stage(doc.last_action_text),
+            "sponsor_name": sp_name,
+            "sponsor_party": sp_party,
+            "sponsor_state": sp_state,
+        })
+
+    results.sort(key=lambda r: r["prompt_score"], reverse=True)
+    res = {
+        "date": search_date,
+        "prompt_expansion": expansion,
+        "total": len(results),
+        "results": results,
+    }
+    try:
+        set_cache(cache_key, res, expire=300)
+    except Exception:
+        pass
+    return res
+
+
+@app.post("/sync/backfill-actions")
+def backfill_actions(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    _auth: None = Depends(require_internal_key),
+):
+    """Backfill bill_actions for all existing stored bills."""
+    if not try_acquire_lock("sync_backfill_actions"):
+        raise HTTPException(status_code=409, detail="An action backfill is already in progress.")
+
+    def _run():
+        from .models import BillAction
+        from .services.sync import parse_date
+        session = SessionLocal()
+        client = CongressAPIClient()
+        try:
+            docs = session.query(LegislativeDocument).all()
+            print(f"Backfilling actions for {len(docs)} bills...")
+            for doc in docs:
+                try:
+                    data = client.fetch_bill_actions(doc.congress, doc.bill_type, doc.bill_number)
+                    actions = data.get("actions", [])
+                    session.query(BillAction).filter(BillAction.document_id == doc.id).delete()
+                    for act in actions:
+                        action_date = parse_date(act.get("actionDate"))
+                        text = (act.get("text") or "").strip()
+                        if not action_date or not text:
+                            continue
+                        source_system = act.get("sourceSystem") or {}
+                        session.add(BillAction(
+                            document_id=doc.id,
+                            action_code=act.get("actionCode"),
+                            action_date=action_date,
+                            text=text,
+                            action_type=act.get("type"),
+                            source_system_code=source_system.get("code"),
+                            source_system_name=source_system.get("name"),
+                        ))
+                    session.commit()
+                except Exception as e:
+                    session.rollback()
+                    print(f"Failed actions for {doc.source_id}: {e}")
+            print("Action backfill complete.")
+        finally:
+            client.close()
+            session.close()
+            release_lock("sync_backfill_actions")
+    background_tasks.add_task(_run)
+    return {"message": "Action backfill started in background."}
+
+
+@app.post("/sync/daily")
+def trigger_daily_sync(
+    background_tasks: BackgroundTasks,
+    _auth: None = Depends(require_internal_key),
+):
+    """Trigger the daily incremental sync manually (used by external cron on free hosting)."""
+    background_tasks.add_task(process_daily_sync)
+    return {"message": "Daily sync started in background."}
+
+
+async def _bg_send_digests(frequency: str):
+    from .services.digest_service import compile_digests
+    from .services.email_render_service import render_digest_html
+    from .services.email_delivery_service import send_html_email
+    
+    db = SessionLocal()
+    try:
+        payloads = compile_digests(db, frequency)
+        for payload in payloads:
+            recipient_email = payload["recipient"]["email"]
+            try:
+                html_content = render_digest_html(payload)
+                subject = f"ALDF {frequency.capitalize()} Digest — {payload['digest_metadata']['generated_at'][:10]}"
+                await send_html_email(recipient_email, subject, html_content)
+            except Exception as e:
+                print(f"Error sending {frequency} digest to {recipient_email}: {e}")
+    finally:
+        db.close()
+        release_lock(f"digest_{frequency}")
+
+
+@app.post("/digest/send/daily")
+def trigger_daily_digest(
+    background_tasks: BackgroundTasks,
+    _auth: None = Depends(require_internal_key),
+):
+    """Trigger compiling and sending daily digest emails to all verified users with daily prompts."""
+    if not try_acquire_lock("digest_daily"):
+        raise HTTPException(status_code=409, detail="A daily digest send is already in progress.")
+    background_tasks.add_task(_bg_send_digests, "daily")
+    return {"message": "Daily digest email sending started in background."}
+
+
+@app.post("/digest/send/weekly")
+def trigger_weekly_digest(
+    background_tasks: BackgroundTasks,
+    _auth: None = Depends(require_internal_key),
+):
+    """Trigger compiling and sending weekly digest emails to all verified users with weekly prompts."""
+    if not try_acquire_lock("digest_weekly"):
+        raise HTTPException(status_code=409, detail="A weekly digest send is already in progress.")
+    background_tasks.add_task(_bg_send_digests, "weekly")
+    return {"message": "Weekly digest email sending started in background."}
+
+
+@app.post("/digest/send-test")
+async def send_test_digest(
+    email: str,
+    frequency: str = "daily",
+    prompt_id: Optional[str] = None,
+    db: Session = Depends(get_db),
+    _auth: None = Depends(require_internal_key),
+):
+    """
+    Generate and send a test digest email immediately to the specified email address.
+    """
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile or not profile.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Only administrators can trigger test digests."
+        )
+
+    from .services.digest_service import compile_single_digest
+    from .services.email_render_service import render_digest_html
+    from .services.email_delivery_service import send_html_email
+
+    # Scoped per-recipient (not global) so different users' test sends don't
+    # block each other — just prevents double-firing for the same address.
+    lock_scope = f"digest_send_test:{email.strip().lower()}:{frequency}"
+    if not try_acquire_lock(lock_scope, ttl_seconds=60):
+        raise HTTPException(status_code=409, detail="A test digest is already being sent to this address.")
+
+    try:
+        payload = compile_single_digest(db, email, frequency, prompt_id=prompt_id)
+        if not payload:
+            raise HTTPException(
+                status_code=404,
+                detail=f"User {email} not found or has no tracking interests."
+            )
+
+        try:
+            html_content = render_digest_html(payload)
+            subject = f"ALDF Test {frequency.capitalize()} Briefing"
+            await send_html_email(email, subject, html_content)
+            return {"message": f"Test email sent successfully to {email}."}
+        except Exception as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to send test email: {str(e)}"
+            )
+    finally:
+        release_lock(lock_scope)
+
+
+
+@app.post("/ai/backfill")
+def trigger_ai_backfill(
+    background_tasks: BackgroundTasks,
+    force: bool = False,
+    _auth: None = Depends(require_internal_key),
+):
+    """Trigger AI processing for all stored bills that are missing AI output.
+    Set force=true to regenerate even for bills that already have AI output.
+    """
+    if not try_acquire_lock("ai_backfill"):
+        raise HTTPException(status_code=409, detail="An AI backfill is already in progress.")
+
+    background_tasks.add_task(_bg_ai_backfill, force)
+    return {"message": "AI backfill started in background.", "force": force}
+
+
+def _bg_purge_non_animal(threshold: int):
+    """Background worker: delete bills whose AI relevance_score is below threshold.
+
+    Bills with no AI output yet are scored first via process_bill_ai() so we
+    don't blindly keep or delete un-scored records.
+    """
+    from .services.ai_processing import process_bill_ai as _process_ai
+    db = SessionLocal()
+    try:
+        docs = db.query(LegislativeDocument).all()
+        total = len(docs)
+        deleted = 0
+        scored = 0
+        print(f"Purge: evaluating {total} bills against threshold={threshold}.")
+        for doc in docs:
+            # Run AI if not yet scored so we have a real score to judge
+            if doc.relevance_score is None:
+                _process_ai(doc, db=db)
+                scored += 1
+            # Skip deletion if AI scoring still failed — don't drop unscored bills
+            if doc.relevance_score is None:
+                print(f"Purge: skipping {doc.source_id} — AI scoring failed, keeping to be safe.")
+                continue
+            score = doc.relevance_score
+            if score < threshold:
+                print(f"Purge: deleting {doc.source_id} (score={score}).")
+                db.delete(doc)
+                db.commit()
+                deleted += 1
+        print(f"Purge complete: {deleted} bills deleted, {scored} newly scored, {total - deleted} kept.")
+        try:
+            from .services.cache import clear_cache
+            clear_cache()
+        except Exception as e:
+            pass
+    except Exception as e:
+        db.rollback()
+        print(f"Purge failed: {e}")
+    finally:
+        db.close()
+
+
+@app.post("/admin/clear-all-data")
+def clear_all_data(
+    db: Session = Depends(get_db),
+    _auth: None = Depends(require_internal_key),
+):
+    """Delete all bills, subjects, actions, and sync logs. Use before a clean backfill."""
+    from .models import BillAction
+    db.query(BillAction).delete()
+    db.query(LegislativeDocument).delete()
+    db.query(Subject).delete()
+    db.query(SyncLog).delete()
+    db.commit()
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except Exception as e:
+        pass
+    return {"message": "All data cleared. Ready for a fresh backfill."}
+
+
+@app.post("/admin/purge-non-animal")
+def purge_non_animal(
+    background_tasks: BackgroundTasks,
+    threshold: int = 30,
+    _auth: None = Depends(require_internal_key),
+):
+    """Delete all stored bills whose animal relevance_score is below `threshold` (default 30).
+
+    Bills that haven't been AI-scored yet are scored first before the decision is made.
+    Runs in the background — check server logs for progress.
+    """
+    background_tasks.add_task(_bg_purge_non_animal, threshold)
+    return {
+        "message": "Purge started in background.",
+        "threshold": threshold,
+        "note": "Bills with relevance_score < threshold will be permanently deleted. Check server logs for progress.",
+    }
+
+
+@app.post("/users", response_model=Dict[str, Any])
+def create_user(
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_token),
+):
+    """Create or update a user profile with tracking preferences."""
+    email = (body.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    if str(_auth.get("sub", "")).lower() != email:
+        raise HTTPException(status_code=403, detail="Token does not authorize this email")
+
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email).first()
+    prompt_text = body.get("prompt")
+
+    if profile:
+        profile.scope = body.get("scope", profile.scope)
+    else:
+        profile = UserProfile(
+            email=email,
+            scope=body.get("scope", "federal"),
+        )
+        db.add(profile)
+        db.flush()
+
+    if prompt_text is not None:
+        prompt_text = prompt_text.strip()
+        frequency = body.get("frequency", "daily")
+        
+        # Check if the user already has a prompt
+        existing_prompt = db.query(UserPrompt).filter(UserPrompt.user_id == profile.id).first()
+        if existing_prompt:
+            if prompt_text != existing_prompt.prompt_text:
+                existing_prompt.prompt_text = prompt_text
+                try:
+                    existing_prompt.expanded_topics = expand_prompt_to_topics(prompt_text, db=db, user_email=email)
+                except Exception as e:
+                    existing_prompt.expanded_topics = None
+            existing_prompt.frequency = frequency
+        else:
+            expansion = None
+            if prompt_text:
+                try:
+                    expansion = expand_prompt_to_topics(prompt_text, db=db, user_email=email)
+                except Exception as e:
+                    pass
+            new_prompt = UserPrompt(
+                user_id=profile.id,
+                prompt_text=prompt_text,
+                frequency=frequency,
+                expanded_topics=expansion,
+            )
+            db.add(new_prompt)
+
+    db.commit()
+    db.refresh(profile)
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except Exception as e:
+        pass
+    return _format_profile(profile)
+
+
+@app.get("/users/{email}", response_model=Dict[str, Any])
+def get_user(
+    email: str,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Fetch a user's tracking preferences."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _format_profile(profile)
+
+
+@app.put("/users/{email}", response_model=Dict[str, Any])
+def update_user(
+    email: str,
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Update a user's tracking preferences."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if "scope" in body:
+        profile.scope = body["scope"]
+    if "review_bills" in body:
+        review_bills = body["review_bills"]
+        if not isinstance(review_bills, list) or not all(isinstance(x, str) for x in review_bills):
+            raise HTTPException(status_code=400, detail="review_bills must be a list of strings")
+        if len(review_bills) > 500:
+            raise HTTPException(status_code=400, detail="review_bills cannot exceed 500 items")
+        if any(len(x) > 100 for x in review_bills):
+            raise HTTPException(status_code=400, detail="review_bills entries must be 100 characters or fewer")
+        profile.review_bills = review_bills
+
+    db.commit()
+    db.refresh(profile)
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except Exception as e:
+        pass
+    return _format_profile(profile)
+
+
+def _format_profile(profile: UserProfile) -> Dict[str, Any]:
+    return {
+        "id": str(profile.id),
+        "email": profile.email,
+        "full_name": profile.full_name,
+        "scope": profile.scope,
+        "review_bills": profile.review_bills or [],
+        "prompts": [
+            {
+                "id": str(p.id),
+                "prompt_text": p.prompt_text,
+                "frequency": p.frequency,
+                "scope": p.scope,
+                "expanded_topics": p.expanded_topics,
+                "created_at": p.created_at.isoformat(),
+                "updated_at": p.updated_at.isoformat(),
+            }
+            for p in profile.prompts
+        ],
+        "is_verified": profile.is_verified,
+        "is_admin": profile.is_admin,
+        "created_at": profile.created_at.isoformat(),
+        "updated_at": profile.updated_at.isoformat(),
+    }
+
+
+@app.get("/users/{email}/prompts", response_model=List[Dict[str, Any]])
+def get_user_prompts(
+    email: str,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Fetch all tracking prompts for a user."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+    return [
+        {
+            "id": str(p.id),
+            "prompt_text": p.prompt_text,
+            "frequency": p.frequency,
+            "scope": p.scope,
+            "expanded_topics": p.expanded_topics,
+            "created_at": p.created_at.isoformat(),
+            "updated_at": p.updated_at.isoformat(),
+        }
+        for p in profile.prompts
+    ]
+
+
+@app.post("/users/{email}/prompts", response_model=Dict[str, Any])
+def create_user_prompt(
+    email: str,
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Create a new tracking prompt for a user."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    prompt_text = (body.get("prompt_text") or "").strip()
+    if not prompt_text:
+        raise HTTPException(status_code=400, detail="prompt_text is required")
+
+    frequency = body.get("frequency", "daily")
+    if frequency not in ["daily", "weekly"]:
+        raise HTTPException(status_code=400, detail="frequency must be 'daily' or 'weekly'")
+
+    scope = body.get("scope", profile.scope)
+    if scope not in ["federal", "priority_states", "all_states"]:
+        raise HTTPException(status_code=400, detail="scope must be 'federal', 'priority_states', or 'all_states'")
+
+    # Run AI expansion
+    expansion = None
+    if prompt_text:
+        try:
+            expansion = expand_prompt_to_topics(prompt_text, db=db, user_email=email.lower())
+        except Exception as e:
+            pass
+
+    new_prompt = UserPrompt(
+        user_id=profile.id,
+        prompt_text=prompt_text,
+        frequency=frequency,
+        scope=scope,
+        expanded_topics=expansion,
+    )
+    db.add(new_prompt)
+    db.commit()
+    db.refresh(new_prompt)
+
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except:
+        pass
+
+    return {
+        "id": str(new_prompt.id),
+        "prompt_text": new_prompt.prompt_text,
+        "frequency": new_prompt.frequency,
+        "scope": new_prompt.scope,
+        "expanded_topics": new_prompt.expanded_topics,
+        "created_at": new_prompt.created_at.isoformat(),
+        "updated_at": new_prompt.updated_at.isoformat(),
+    }
+
+
+@app.put("/users/{email}/prompts/{prompt_id}", response_model=Dict[str, Any])
+def update_user_prompt(
+    email: str,
+    prompt_id: str,
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Update an existing tracking prompt."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    import uuid
+    try:
+        p_uuid = uuid.UUID(prompt_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid prompt_id format")
+
+    prompt = db.query(UserPrompt).filter(UserPrompt.id == p_uuid, UserPrompt.user_id == profile.id).first()
+    if not prompt:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+
+    prompt_text = body.get("prompt_text")
+    if prompt_text is not None:
+        prompt_text = prompt_text.strip()
+        if not prompt_text:
+            raise HTTPException(status_code=400, detail="prompt_text cannot be empty")
+        
+        # If text changed, trigger re-expansion
+        if prompt_text != prompt.prompt_text:
+            prompt.prompt_text = prompt_text
+            try:
+                prompt.expanded_topics = expand_prompt_to_topics(prompt_text, db=db, user_email=email.lower())
+            except Exception as e:
+                prompt.expanded_topics = None
+
+    if "frequency" in body:
+        frequency = body["frequency"]
+        if frequency not in ["daily", "weekly"]:
+            raise HTTPException(status_code=400, detail="frequency must be 'daily' or 'weekly'")
+        prompt.frequency = frequency
+
+    if "scope" in body:
+        scope = body["scope"]
+        if scope not in ["federal", "priority_states", "all_states"]:
+            raise HTTPException(status_code=400, detail="scope must be 'federal', 'priority_states', or 'all_states'")
+        prompt.scope = scope
+
+    db.commit()
+    db.refresh(prompt)
+
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except:
+        pass
+
+    return {
+        "id": str(prompt.id),
+        "prompt_text": prompt.prompt_text,
+        "frequency": prompt.frequency,
+        "scope": prompt.scope,
+        "expanded_topics": prompt.expanded_topics,
+        "created_at": prompt.created_at.isoformat(),
+        "updated_at": prompt.updated_at.isoformat(),
+    }
+
+
+@app.delete("/users/{email}/prompts/{prompt_id}")
+def delete_user_prompt(
+    email: str,
+    prompt_id: str,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Delete a tracking prompt."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    import uuid
+    try:
+        p_uuid = uuid.UUID(prompt_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid prompt_id format")
+
+    prompt = db.query(UserPrompt).filter(UserPrompt.id == p_uuid, UserPrompt.user_id == profile.id).first()
+    if not prompt:
+        raise HTTPException(status_code=404, detail="Prompt not found")
+
+    db.delete(prompt)
+    db.commit()
+
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except:
+        pass
+
+    return {"detail": "Prompt deleted successfully"}
+
+
+@app.get("/users/{email}/review-bills")
+def get_review_bills(
+    email: str,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Return full bill details for all bills the user has manually added to their watchlist."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # ok
+    source_ids = profile.review_bills or []
+    if not source_ids:
+        return {"results": [], "total": 0}
+
+    docs = (
+        db.query(LegislativeDocument)
+        .options(selectinload(LegislativeDocument.subjects))
+        .filter(LegislativeDocument.source_id.in_(source_ids))
+        .all()
+    )
+    results = []
+    for doc in docs:
+        sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+        results.append({
+            "id": str(doc.id),
+            "source_id": doc.source_id,
+            "title": doc.title,
+            "congress": doc.congress,
+            "bill_type": doc.bill_type,
+            "bill_number": doc.bill_number,
+            "introduced_date": doc.introduced_date.isoformat() if doc.introduced_date else None,
+            "origin_chamber": doc.origin_chamber,
+            "policy_area": doc.policy_area,
+            "current_stage": get_current_stage(doc.last_action_text),
+            "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+            "last_action_text": doc.last_action_text,
+            "sponsor_name": sp_name,
+            "sponsor_party": sp_party,
+            "sponsor_state": sp_state,
+            "subjects": [s.name for s in doc.subjects],
+            "relevance_score": doc.relevance_score,
+            "relevance_topics": doc.relevance_topics,
+            "ai_summary": doc.ai_summary,
+        })
+    return {"results": results, "total": len(results)}
+
+
+@app.get("/users/{email}/tags")
+def get_user_tags(
+    email: str,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Return the distinct tag names this user has ever applied to a bill."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    rows = (
+        db.query(BillTag.tag_name)
+        .filter(BillTag.user_id == profile.id)
+        .distinct()
+        .order_by(BillTag.tag_name)
+        .all()
+    )
+    return {"tags": [r[0] for r in rows]}
+
+
+@app.post("/users/{email}/bills/{source_id}/tags")
+def add_bill_tag(
+    email: str,
+    source_id: str,
+    body: Dict[str, Any],
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Add a tag to a bill for this user. Body: {tag: string}."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    doc = db.query(LegislativeDocument).filter(LegislativeDocument.source_id == source_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bill not found")
+
+    tag_name = (body.get("tag") or "").strip().lower()
+    if not tag_name:
+        raise HTTPException(status_code=400, detail="tag is required")
+    if len(tag_name) > 100:
+        raise HTTPException(status_code=400, detail="tag must be 100 characters or fewer")
+
+    existing = db.query(BillTag).filter(
+        BillTag.user_id == profile.id,
+        BillTag.document_id == doc.id,
+        BillTag.tag_name == tag_name,
+    ).first()
+    if not existing:
+        db.add(BillTag(user_id=profile.id, document_id=doc.id, tag_name=tag_name))
+        db.commit()
+        try:
+            from .services.cache import clear_cache
+            clear_cache()
+        except Exception:
+            pass
+
+    tags = [
+        t[0] for t in db.query(BillTag.tag_name).filter(
+            BillTag.user_id == profile.id, BillTag.document_id == doc.id
+        ).all()
+    ]
+    return {"tags": tags}
+
+
+@app.delete("/users/{email}/bills/{source_id}/tags/{tag}")
+def remove_bill_tag(
+    email: str,
+    source_id: str,
+    tag: str,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Remove a tag from a bill for this user."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    doc = db.query(LegislativeDocument).filter(LegislativeDocument.source_id == source_id).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Bill not found")
+
+    tag_name = tag.strip().lower()
+    db.query(BillTag).filter(
+        BillTag.user_id == profile.id,
+        BillTag.document_id == doc.id,
+        BillTag.tag_name == tag_name,
+    ).delete()
+    db.commit()
+    try:
+        from .services.cache import clear_cache
+        clear_cache()
+    except Exception:
+        pass
+
+    tags = [
+        t[0] for t in db.query(BillTag.tag_name).filter(
+            BillTag.user_id == profile.id, BillTag.document_id == doc.id
+        ).all()
+    ]
+    return {"tags": tags}
+
+
+@app.get("/subjects")
+def list_subjects(db: Session = Depends(get_db)):
+    """
+    Lists subjects with the count of matched bills.
+    """
+    from .services.cache import get_cache, set_cache
+    cache_key = "aldf:cache:subjects"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+    results = db.query(
+        Subject.name,
+        Subject.category,
+        func.count(LegislativeDocument.id).label("document_count")
+    ).join(
+        LegislativeDocument.subjects
+    ).group_by(
+        Subject.name,
+        Subject.category,
+    ).order_by(
+        func.count(LegislativeDocument.id).desc(),
+        Subject.name
+    ).all()
+
+    res = [
+        {"name": name, "category": category, "document_count": count}
+        for name, category, count in results
+    ]
+    try:
+        set_cache(cache_key, res, expire=300)
+    except Exception as e:
+        pass
+    return res
+
+
+@app.get("/subjects/grouped")
+def list_subjects_grouped(db: Session = Depends(get_db)):
+    """
+    Lists subjects grouped by ALDF focus-area category (stored on each Subject row).
+    Returns an ordered list of { category, subjects: [{ name, document_count }] }.
+    """
+    from .services.cache import get_cache, set_cache
+    cache_key = "aldf:cache:subjects:grouped"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+
+    CATEGORY_ORDER = list(SUBJECT_CATEGORIES.keys()) + ["Region", "Other"]
+
+    rows = db.query(
+        Subject.category,
+        Subject.name,
+        func.count(LegislativeDocument.id).label("document_count")
+    ).join(
+        LegislativeDocument.subjects
+    ).group_by(
+        Subject.category,
+        Subject.name,
+    ).order_by(
+        func.count(LegislativeDocument.id).desc(),
+        Subject.name
+    ).all()
+
+    groups: dict = {cat: [] for cat in CATEGORY_ORDER}
+    for category, name, count in rows:
+        bucket = category if category and category in groups else "Other"
+        groups[bucket].append({"name": name, "document_count": count})
+
+    res = [
+        {"category": cat, "subjects": groups[cat]}
+        for cat in CATEGORY_ORDER
+        if groups[cat]
+    ]
+    try:
+        set_cache(cache_key, res, expire=300)
+    except Exception:
+        pass
+    return res
+
+
+@app.get("/stats/overview")
+def get_stats_overview(db: Session = Depends(get_db)):
+    """
+    Retrieve overview statistics for the active bills database.
+    """
+    from .services.cache import get_cache, set_cache
+    cache_key = "aldf:cache:stats:overview"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+    total_active_bills = db.query(LegislativeDocument).count()
+    
+    unique_subjects = db.query(Subject).join(LegislativeDocument.subjects).distinct().count()
+    
+    min_date, max_date = db.query(
+        func.min(LegislativeDocument.introduced_date),
+        func.max(LegislativeDocument.introduced_date)
+    ).first()
+    
+    bill_types = db.query(
+        LegislativeDocument.bill_type,
+        func.count(LegislativeDocument.id)
+    ).group_by(LegislativeDocument.bill_type).all()
+    
+    res = {
+        "total_active_bills": total_active_bills,
+        "unique_subjects": unique_subjects,
+        "date_range": {
+            "min_date": min_date.isoformat() if min_date else None,
+            "max_date": max_date.isoformat() if max_date else None
+        },
+        "bills_by_bill_type": {bt: count for bt, count in bill_types}
+    }
+    try:
+        set_cache(cache_key, res, expire=300)
+    except Exception as e:
+        pass
+    return res
+
+
+@app.get("/stats/policy-areas")
+def get_stats_policy_areas(db: Session = Depends(get_db)):
+    """
+    Retrieve document count grouped by policy area.
+    """
+    from .services.cache import get_cache, set_cache
+    cache_key = "aldf:cache:stats:policy-areas"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+    results = db.query(
+        LegislativeDocument.policy_area,
+        func.count(LegislativeDocument.id)
+    ).group_by(LegislativeDocument.policy_area).all()
+    
+    res = {pa: count for pa, count in results if pa}
+    try:
+        set_cache(cache_key, res, expire=300)
+    except Exception as e:
+        pass
+    return res
+
+
+@app.get("/stats/subjects")
+def get_stats_subjects(db: Session = Depends(get_db)):
+    """
+    Retrieve document count grouped by subject.
+    """
+    from .services.cache import get_cache, set_cache
+    cache_key = "aldf:cache:stats:subjects"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+    results = db.query(
+        Subject.name,
+        func.count(LegislativeDocument.id)
+    ).join(LegislativeDocument.subjects).group_by(Subject.name).all()
+    
+    res = {name: count for name, count in results}
+    try:
+        set_cache(cache_key, res, expire=300)
+    except Exception as e:
+        pass
+    return res
+
+
+@app.get("/export/csv")
+def export_csv(db: Session = Depends(get_db)):
+    """
+    Export the matching documents dataset as a CSV file.
+    """
+    def generate():
+        output = io.StringIO()
+        writer = csv.writer(output)
+        
+        writer.writerow([
+            "id", "source_id", "title", "congress", "bill_type", "bill_number",
+            "introduced_date", "origin_chamber", "policy_area", "current_stage",
+            "last_action_date", "last_action_text", "update_date", "update_date_incl_text",
+            "sponsor_name", "sponsor_party", "sponsor_state", "source_url", "ingested_at", "subjects"
+        ])
+        yield output.getvalue()
+        output.seek(0)
+        output.truncate(0)
+        
+        docs = db.query(LegislativeDocument).order_by(LegislativeDocument.introduced_date.desc()).all()
+        for doc in docs:
+            subjects_str = "|".join([s.name for s in doc.subjects])
+            current_stage = get_current_stage(doc.last_action_text)
+            sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+            writer.writerow([
+                str(doc.id),
+                doc.source_id,
+                doc.title or "",
+                doc.congress,
+                doc.bill_type,
+                doc.bill_number,
+                doc.introduced_date.isoformat() if doc.introduced_date else "",
+                doc.origin_chamber or "",
+                doc.policy_area or "",
+                current_stage,
+                doc.last_action_date.isoformat() if doc.last_action_date else "",
+                doc.last_action_text or "",
+                doc.update_date.isoformat() if doc.update_date else "",
+                doc.update_date_incl_text.isoformat() if doc.update_date_incl_text else "",
+                sp_name or "",
+                sp_party or "",
+                sp_state or "",
+                doc.source_url or "",
+                doc.ingested_at.isoformat() if doc.ingested_at else "",
+                subjects_str
+            ])
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=animal_legislation_export.csv"}
+    )
+
+
+@app.get("/export/json")
+def export_json(include_raw: bool = False, db: Session = Depends(get_db)):
+    """
+    Export the matching documents dataset as a JSON file.
+    """
+    def generate():
+        docs = db.query(LegislativeDocument).order_by(LegislativeDocument.introduced_date.desc()).all()
+        yield "["
+        for i, doc in enumerate(docs):
+            sp_name, sp_party, sp_state = extract_sponsor_info(doc.api_raw)
+            doc_dict = {
+                "id": str(doc.id),
+                "source_id": doc.source_id,
+                "title": doc.title,
+                "congress": doc.congress,
+                "bill_type": doc.bill_type,
+                "bill_number": doc.bill_number,
+                "introduced_date": doc.introduced_date.isoformat() if doc.introduced_date else None,
+                "origin_chamber": doc.origin_chamber,
+                "policy_area": doc.policy_area,
+                "current_stage": get_current_stage(doc.last_action_text),
+                "last_action_date": doc.last_action_date.isoformat() if doc.last_action_date else None,
+                "last_action_text": doc.last_action_text,
+                "update_date": doc.update_date.isoformat() if doc.update_date else None,
+                "update_date_incl_text": doc.update_date_incl_text.isoformat() if doc.update_date_incl_text else None,
+                "sponsor_name": sp_name,
+                "sponsor_party": sp_party,
+                "sponsor_state": sp_state,
+                "source_url": doc.source_url,
+                "ingested_at": doc.ingested_at.isoformat(),
+                "updated_at": doc.updated_at.isoformat(),
+                "source_hash": doc.source_hash,
+                "subjects": [s.name for s in doc.subjects]
+            }
+            if include_raw:
+                doc_dict["api_raw"] = doc.api_raw
+                
+            json_str = json.dumps(doc_dict)
+            if i > 0:
+                yield "," + json_str
+            else:
+                yield json_str
+        yield "]"
+
+    return StreamingResponse(
+        generate(),
+        media_type="application/json",
+        headers={"Content-Disposition": "attachment; filename=animal_legislation_export.json"}
+    )
+
+# ── Auth Endpoints ────────────────────────────────────────────────────────────
+
+@app.post("/auth/signup")
+async def auth_signup(body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Register a new user. Sends a verification email before granting access."""
+    from .services.auth import hash_password, generate_verification_token
+    from .services.email_service import send_verification_email
+
+    email = (body.get("email") or "").strip().lower()
+    password = (body.get("password") or "").strip()
+    full_name = (body.get("name") or body.get("full_name") or "").strip() or None
+
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    if not password or len(password) < 6:
+        raise HTTPException(status_code=400, detail="password must be at least 6 characters")
+
+    existing = db.query(UserProfile).filter(func.lower(UserProfile.email) == email).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+    token = generate_verification_token()
+    profile = UserProfile(
+        email=email,
+        full_name=full_name,
+        password_hash=hash_password(password),
+        is_verified=False,
+        verification_token=token,
+    )
+    db.add(profile)
+    db.commit()
+
+    origin = (body.get("origin") or "frontend").strip()
+
+    try:
+        await send_verification_email(email, token, origin=origin)
+    except Exception as e:
+        print(f"[auth/signup] Email send failed: {e}")
+        # Don't block signup if email fails — user can request a resend later
+
+    return {"message": "Account created. Please check your email to verify your account."}
+
+
+@app.get("/auth/verify/{token}")
+def auth_verify(token: str, origin: str = "frontend", db: Session = Depends(get_db)):
+    """Verify a user's email address via the token link sent in the signup email."""
+    from fastapi.responses import RedirectResponse
+    from .config import settings as cfg
+
+    print(f"[auth/verify] origin={origin!r} FRONTEND_URL={cfg.FRONTEND_URL!r} FRONTEND3_URL={cfg.FRONTEND3_URL!r}")
+
+    profile = db.query(UserProfile).filter(UserProfile.verification_token == token).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Invalid or expired verification token")
+
+    profile.is_verified = True
+    profile.verification_token = None
+    db.commit()
+
+    base_url = (cfg.FRONTEND3_URL if origin == "frontend3" else cfg.FRONTEND_URL).rstrip("/")
+    print(f"[auth/verify] redirecting to {base_url}?verified=true")
+    return RedirectResponse(url=f"{base_url}?verified=true")
+
+
+@app.post("/auth/verify-and-activate")
+def auth_verify_and_activate(body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Verify a user's email, check their password, and activate their account."""
+    from .services.auth import verify_password, create_access_token
+
+    token = body.get("token")
+    email = (body.get("email") or "").strip().lower()
+    password = (body.get("password") or "").strip()
+
+    if not token or not email or not password:
+        raise HTTPException(status_code=400, detail="token, email, and password are required")
+
+    profile = db.query(UserProfile).filter(UserProfile.verification_token == token).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="Invalid or expired verification token")
+
+    if profile.email.lower() != email:
+        raise HTTPException(status_code=400, detail="Email address does not match this verification token")
+
+    if not profile.password_hash or not verify_password(password, profile.password_hash):
+        raise HTTPException(status_code=401, detail="Incorrect password")
+
+    profile.is_verified = True
+    profile.verification_token = None
+    db.commit()
+
+    jwt_token = create_access_token({"sub": profile.email})
+    return {
+        "access_token": jwt_token,
+        "token_type": "bearer",
+        "email": profile.email,
+        "message": "Account successfully verified and activated."
+    }
+
+
+@app.post("/auth/login")
+def auth_login(body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Authenticate a verified user. Returns a JWT access token."""
+    from .services.auth import verify_password, create_access_token
+
+    email = (body.get("email") or "").strip().lower()
+    password = (body.get("password") or "").strip()
+
+    if not email or not password:
+        raise HTTPException(status_code=400, detail="email and password are required")
+
+    profile = db.query(UserProfile).filter(
+        func.lower(UserProfile.email) == email
+    ).first()
+
+    if not profile or not profile.password_hash:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not verify_password(password, profile.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not profile.is_verified:
+        raise HTTPException(status_code=403, detail="Please verify your email before logging in")
+
+    token = create_access_token({"sub": email})
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "email": email,
+    }
+
+
+@app.get("/auth/me", response_model=Dict[str, Any])
+def auth_me(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    """Return the currently authenticated user's profile, based on the JWT
+    issued by /auth/login or /auth/verify-and-activate."""
+    from .services.auth import decode_access_token
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+
+    token = authorization[len("Bearer "):].strip()
+    payload = decode_access_token(token)
+    if not payload or not payload.get("sub"):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == payload["sub"].lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return _format_profile(profile)
+
+
+@app.post("/auth/resend-verification")
+async def auth_resend_verification(body: Dict[str, Any], db: Session = Depends(get_db)):
+    """Resend the verification email if the user hasn't verified yet."""
+    from .services.auth import generate_verification_token
+    from .services.email_service import send_verification_email
+
+    email = (body.get("email") or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="No account found with this email")
+    if profile.is_verified:
+        return {"message": "This account is already verified. Please log in."}
+
+    token = generate_verification_token()
+    profile.verification_token = token
+    db.commit()
+
+    await send_verification_email(email, token)
+    return {"message": "Verification email resent. Please check your inbox."}
+
+
+# Serve React build (frontend/dist) as static files
+frontend_dist_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "frontend", "dist")
+frontend_assets_dir = os.path.join(frontend_dist_dir, "assets")
+
+if os.path.exists(frontend_assets_dir):
+    app.mount("/assets", StaticFiles(directory=frontend_assets_dir), name="assets")
+
+@app.get("/favicon.svg")
+def read_favicon():
+    return FileResponse(os.path.join(frontend_dist_dir, "favicon.svg"))
+
+@app.get("/icons.svg")
+def read_icons():
+    return FileResponse(os.path.join(frontend_dist_dir, "icons.svg"))
+
+@app.get("/")
+def read_index():
+    return FileResponse(os.path.join(frontend_dist_dir, "index.html"))
+
+@app.get("/{full_path:path}")
+def serve_spa(full_path: str):
+    return FileResponse(os.path.join(frontend_dist_dir, "index.html"))

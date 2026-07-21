@@ -1,0 +1,510 @@
+import ast
+import json
+import logging
+import re
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+from sqlalchemy.orm import Session
+
+from ..config import settings
+from ..models import LegislativeDocument, UserProfile, UserPrompt
+from .congress_api import CongressAPIClient
+from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
+
+# Approved relevance topics the model may tag a bill with. Kept aligned with the
+# matching subjects so AI output stays within the project's animal/environment scope.
+RELEVANCE_TOPICS = [
+    "Animal welfare",
+    "Wildlife conservation",
+    "Endangered species",
+    "Livestock and agriculture",
+    "Aquatic life and fisheries",
+    "Veterinary and animal health",
+    "Hunting and trapping",
+    "Animal cruelty and crimes",
+    "Service and companion animals",
+    "Habitat and land use",
+    "Environmental protection",
+    "Food safety and labeling",
+    "Trafficking and smuggling",
+]
+
+_BILL_NUMBER_RE = re.compile(
+    r"""
+    (?:
+        # source_id format: 119-HR-65
+        (\d{3})-([A-Za-z]+)-(\d+)
+    |
+        # standard: HR 65, H.R.65, S.1234, HJRES 4, SCONRES 12, etc.
+        (H\.?R\.?|S\.?|H\.?J\.?RES\.?|S\.?J\.?RES\.?|H\.?CON\.?RES\.?|S\.?CON\.?RES\.?|H\.?RES\.?|S\.?RES\.?)
+        [\s.\-]*(\d+)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+SYSTEM_PROMPT = (
+    "You are an analyst for an animal-welfare and environmental legislative tracking "
+    "system. You score how relevant a U.S. congressional bill is to animal protection, "
+    "wildlife, and related environmental concerns, and you write a concise plain-language "
+    "impact summary for advocacy staff. Be factual and grounded only in the provided text. "
+    "Always respond with a single JSON object and nothing else."
+)
+
+
+
+# Caps to keep prompt size (and cost) bounded on bills with very long summaries.
+MAX_SUMMARY_CHARS = 8000
+MAX_ACTION_CHARS = 2000
+
+
+def _strip_html(text: Optional[str]) -> Optional[str]:
+    """Remove HTML tags and collapse whitespace from a summary blob."""
+    if not text:
+        return text
+    no_tags = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", no_tags).strip()
+
+
+def _build_user_prompt(document: LegislativeDocument) -> str:
+    """Assemble the per-bill prompt from the fields we already have on the document."""
+    summary = _strip_html(document.official_summary) or "(no official summary available)"
+    if len(summary) > MAX_SUMMARY_CHARS:
+        summary = summary[:MAX_SUMMARY_CHARS] + " ...[truncated]"
+
+    last_action = (document.last_action_text or "")[:MAX_ACTION_CHARS]
+    subjects = [s.name for s in document.subjects] if document.subjects else []
+
+    parts = [
+        f"Bill: {document.source_id}",
+        f"Title: {document.title or '(untitled)'}",
+        f"Policy area: {document.policy_area or '(none)'}",
+        f"Congress.gov subjects: {', '.join(subjects) if subjects else '(none)'}",
+        f"Latest action: {last_action or '(none)'}",
+        "",
+        "Official summary:",
+        summary,
+        "",
+        "Allowed relevance topics (choose only from this list):",
+        ", ".join(RELEVANCE_TOPICS),
+        "",
+        "Respond with a JSON object with exactly these keys:",
+        '  "relevance_score": integer 0-100 (how relevant to animal welfare / wildlife / '
+        "related environmental concerns; 0 = unrelated, 100 = central focus),",
+        '  "relevance_topics": array of strings drawn ONLY from the allowed topics list above,',
+        '  "relevance_rationale": one or two sentences justifying the score,',
+        '  "ai_summary": a 2-4 sentence plain-language impact summary for advocacy staff.',
+    ]
+    return "\n".join(parts)
+
+
+def _call_llm(user_prompt: str) -> Dict[str, Any]:
+    """Call the OpenRouter chat-completions endpoint and return parsed JSON output."""
+    url = f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        # Optional attribution headers recommended by OpenRouter.
+        "X-Title": "AnimalLegislationTracker",
+    }
+    # Try the primary model first, then any fallbacks configured in settings.
+    models_to_try = [settings.LLM_MODEL] + list(getattr(settings, "FALLBACK_LLM_MODELS", []) or [])
+    last_exc: Optional[Exception] = None
+
+    for idx, model_name in enumerate(models_to_try):
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                response = client.post(url, headers=headers, json=payload)
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    body = response.text.strip()
+                    detail = f"OpenRouter request failed with {response.status_code} for model {model_name}"
+                    if body:
+                        detail = f"{detail}: {body[:1000]}"
+                    last_exc = RuntimeError(detail)
+                    # If provider says model is EOL or 404, try next fallback if available
+                    if response.status_code == 404 and idx < len(models_to_try) - 1:
+                        continue
+                    raise last_exc from exc
+                data = response.json()
+
+            content = data["choices"][0]["message"]["content"]
+            return _parse_llm_json(content)
+        except Exception as e:
+            # Keep the last exception and try next model if available
+            last_exc = e
+            continue
+
+    # All model attempts failed — raise with the last error for visibility.
+    if last_exc:
+        raise RuntimeError(f"All LLM attempts failed: {last_exc}") from last_exc
+    raise RuntimeError("LLM call failed without exception detail")
+
+
+def _parse_llm_json(content: str) -> Dict[str, Any]:
+    """Parse the model's JSON reply, tolerating ```json fences or surrounding prose."""
+    first_exc = None
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        first_exc = e
+        logger.debug("Initial JSON parse failed, attempting sanitization: %s", e)
+
+    def _sanitize_control_chars(s: str) -> str:
+        """Replace raw control characters with safe JSON escapes ONLY inside string values."""
+        def _escape_inside_quotes(match: re.Match) -> str:
+            val = match.group(0)
+            def _repl(m: re.Match) -> str:
+                ch = m.group(0)
+                if ch == "\n":
+                    return "\\n"
+                if ch == "\r":
+                    return "\\r"
+                if ch == "\t":
+                    return "\\t"
+                return "\\u%04x" % ord(ch)
+            sanitized_val = re.sub(r"[\x00-\x1f]", _repl, val[1:-1])
+            return f'"{sanitized_val}"'
+
+        return re.sub(r'"(?:[^"\\]|\\.)*"', _escape_inside_quotes, s)
+
+    # Try sanitizing the whole content and parse again
+    try:
+        sanitized = _sanitize_control_chars(content)
+        return json.loads(sanitized)
+    except json.JSONDecodeError:
+        logger.debug("Sanitized parse failed, attempting to extract JSON object from sanitized content.")
+
+    # As a last resort try to extract the first {...} block, sanitize it, and parse
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if not match:
+        # Re-raise the original parse error to preserve context
+        raise first_exc
+
+    try:
+        obj_text = _sanitize_control_chars(match.group(0))
+        return json.loads(obj_text)
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: model may have returned a Python dict literal (single quotes).
+    # ast.literal_eval is safe — it only evaluates literals, not arbitrary code.
+    try:
+        result = ast.literal_eval(match.group(0))
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+
+    logger.exception("Failed to parse LLM JSON after sanitization and extraction.")
+    raise first_exc
+
+
+def _normalize_output(raw: Dict[str, Any]) -> Tuple[int, List[str], str, str]:
+    """Coerce and validate the model output into the columns we store."""
+    try:
+        score = int(round(float(raw.get("relevance_score", 0))))
+    except (TypeError, ValueError):
+        score = 0
+    score = max(0, min(100, score))
+
+    topics_raw = raw.get("relevance_topics") or []
+    if isinstance(topics_raw, str):
+        topics_raw = [topics_raw]
+    allowed = set(RELEVANCE_TOPICS)
+    topics = [t for t in topics_raw if isinstance(t, str) and t in allowed]
+
+    rationale = str(raw.get("relevance_rationale") or "").strip()
+    summary = str(raw.get("ai_summary") or "").strip()
+
+    return score, topics, rationale, summary
+
+
+# ---------------------------------------------------------------------------
+# Prompt expansion & personalized scoring
+# ---------------------------------------------------------------------------
+
+def expand_prompt_to_topics(user_prompt: str, db: Optional[Session] = None, user_email: Optional[str] = None) -> Dict[str, Any]:
+    """Map a free-text user prompt to a structured set of RELEVANCE_TOPICS, keywords, and inferred filters.
+
+    Cache hierarchy:
+      1. Redis (keyed by prompt text, 1 hour TTL) — fastest, shared across users
+      2. UserProfile.expanded_topics (persistent per-user DB cache)
+      3. LLM call — only when both caches miss
+
+    Returns dict with keys:
+        topics   – list of matched RELEVANCE_TOPICS strings
+        keywords – list of lowercase freetext keywords for title/summary matching
+        inferred_filters - dict containing inferred filter values (subject, origin_chamber, bill_type, date_from, date_to, state)
+    """
+    default_filters = {
+        "subject": None,
+        "origin_chamber": None,
+        "bill_type": None,
+        "date_from": None,
+        "date_to": None,
+        "state": None,
+    }
+    if not user_prompt or not user_prompt.strip():
+        return {"topics": [], "keywords": [], "inferred_filters": default_filters}
+
+    from .cache import get_cache, set_cache
+    import hashlib
+    prompt_key = "aldf:cache:expansion:v2:" + hashlib.sha256(user_prompt.strip().encode()).hexdigest()
+
+    # 1. Redis cache
+    cached = get_cache(prompt_key)
+    if cached is not None and isinstance(cached, dict) and "inferred_filters" in cached:
+        return cached
+
+    # 2. Persistent UserPrompt cache
+    if db and user_email:
+        prompt_record = db.query(UserPrompt).join(UserProfile).filter(
+            UserProfile.email == user_email,
+            UserPrompt.prompt_text == user_prompt
+        ).first()
+        if prompt_record and prompt_record.expanded_topics and isinstance(prompt_record.expanded_topics, dict) and "inferred_filters" in prompt_record.expanded_topics:
+            set_cache(prompt_key, prompt_record.expanded_topics, expire=3600)
+            return prompt_record.expanded_topics
+
+    url = f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": "AnimalLegislationTracker",
+    }
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    expansion_prompt = (
+        f"A user wants to track: \"{user_prompt.strip()}\"\n\n"
+        f"Map this to the most relevant topics from this exact list:\n"
+        f"{', '.join(RELEVANCE_TOPICS)}\n\n"
+        f"Also extract 3-6 specific lowercase keywords from the user's request that would appear in bill titles or summaries.\n\n"
+        f"Additionally, infer any structured filters mentioned in the user's request. Current date for reference: {current_date}.\n"
+        f"The fields to infer are:\n"
+        f"1. 'subject': Map to the single most relevant subject from the allowed topics list above ONLY if the user's prompt explicitly specifies or constraints the subject/topic category (e.g. 'wildlife', 'animal cruelty'). If the prompt is just a bill name or a general keyword search without explicit topic constraints, return null.\n"
+        f"2. 'origin_chamber': 'House' or 'Senate', or null if not applicable.\n"
+        f"3. 'bill_type': one of 'HR', 'S', 'HJRES', 'SJRES', 'HCONRES', 'SCONRES', 'HRES', 'SRES', or null if not applicable.\n"
+        f"4. 'date_from': YYYY-MM-DD date or null if not applicable.\n"
+        f"5. 'date_to': YYYY-MM-DD date or null if not applicable.\n"
+        f"6. 'state': state name or two-letter abbreviation, or null if not applicable.\n\n"
+        f"Respond with a JSON object with exactly these keys:\n"
+        f'  "topics": array of strings chosen ONLY from the list above,\n'
+        f'  "keywords": array of lowercase keyword strings,\n'
+        f'  "inferred_filters": a JSON object containing the keys "subject", "origin_chamber", "bill_type", "date_from", "date_to", and "state" with their inferred values.'
+    )
+    payload = {
+        "model": settings.LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "You map user tracking preferences to structured topic lists and infer filters. Always respond with a single JSON object and nothing else."},
+            {"role": "user", "content": expansion_prompt},
+        ],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.post(url, headers=headers, json=payload)
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                body = response.text.strip()
+                detail = f"OpenRouter request failed with {response.status_code}"
+                if body:
+                    detail = f"{detail}: {body[:1000]}"
+                raise RuntimeError(detail) from exc
+            raw = _parse_llm_json(response.json()["choices"][0]["message"]["content"])
+        allowed = set(RELEVANCE_TOPICS)
+        
+        inferred = raw.get("inferred_filters") or {}
+        result = {
+            "topics": [t for t in (raw.get("topics") or []) if isinstance(t, str) and t in allowed],
+            "keywords": [k.lower().strip() for k in (raw.get("keywords") or []) if isinstance(k, str)],
+            "inferred_filters": {
+                "subject": inferred.get("subject") if isinstance(inferred.get("subject"), str) else None,
+                "origin_chamber": inferred.get("origin_chamber") if isinstance(inferred.get("origin_chamber"), str) else None,
+                "bill_type": inferred.get("bill_type") if isinstance(inferred.get("bill_type"), str) else None,
+                "date_from": inferred.get("date_from") if isinstance(inferred.get("date_from"), str) else None,
+                "date_to": inferred.get("date_to") if isinstance(inferred.get("date_to"), str) else None,
+                "state": inferred.get("state") if isinstance(inferred.get("state"), str) else None,
+            }
+        }
+    except Exception as e:
+        logger.warning(f"Prompt expansion failed, falling back to keyword-only: {e}")
+        result = {
+            "topics": [],
+            "keywords": [w.lower() for w in user_prompt.strip().split() if len(w) > 3],
+            "inferred_filters": default_filters,
+        }
+
+    # Store in Redis (1 hour)
+    try:
+        set_cache(prompt_key, result, expire=3600)
+    except Exception:
+        pass
+
+    # Persist to UserProfile cache
+    if db and user_email:
+        profile = db.query(UserProfile).filter(UserProfile.email == user_email).first()
+        if profile:
+            profile.expanded_topics = result
+            db.commit()
+
+    return result
+
+
+def score_against_prompt(doc: LegislativeDocument, topics: List[str], keywords: List[str], prompt_text: Optional[str] = None) -> int:
+    """Score a document against a user prompt using semantic similarity.
+
+    When prompt_text is supplied (preferred), uses embedding-based cosine
+    similarity via semantic_scoring. Falls back to the original keyword/topic
+    scoring when embeddings are unavailable.
+    """
+    # Check if prompt_text matches a bill number pattern and the doc's source_id or bill_number contains it
+    if prompt_text and prompt_text.strip():
+        p_clean = prompt_text.strip().lower()
+        if p_clean.isdigit():
+            bnum_clean = doc.bill_number.lower() if doc.bill_number else ""
+            if p_clean == bnum_clean:
+                return doc.relevance_score if doc.relevance_score is not None else 100
+        elif _BILL_NUMBER_RE.search(p_clean):
+            sid_clean = doc.source_id.lower()
+            bnum_clean = doc.bill_number.lower() if doc.bill_number else ""
+            p_no_spaces = p_clean.replace(" ", "").replace("-", "")
+            sid_no_spaces = sid_clean.replace("-", "")
+            
+            # Extract number part
+            m = _BILL_NUMBER_RE.search(p_clean)
+            num_part = m.group(3) or m.group(5)
+            
+            if (p_clean in sid_clean) or (p_no_spaces in sid_no_spaces) or (num_part and num_part == bnum_clean):
+                return doc.relevance_score if doc.relevance_score is not None else 100
+
+    # Semantic path — uses embedding cosine similarity
+    if prompt_text and prompt_text.strip() and doc.embedding is not None:
+        try:
+            from .semantic_scoring import semantic_score, prompt_embedding_for_digest
+            emb = prompt_embedding_for_digest(prompt_text)
+            if emb is not None:
+                return semantic_score(doc, emb)
+        except Exception as e:
+            logger.warning(f"Semantic scoring failed, falling back: {e}")
+
+    # Keyword fallback (used when embedding call fails or prompt_text not given, or doc lacks embedding)
+    if not topics and not keywords and not prompt_text:
+        return doc.relevance_score or 0
+
+    score = 0
+    topic_set = set(topics)
+    doc_topics = set(doc.relevance_topics or [])
+    doc_subjects = {s.name.lower() for s in doc.subjects} if doc.subjects else set()
+    title_lower = (doc.title or "").lower()
+    summary_lower = (doc.ai_summary or "").lower()
+    policy_lower = (doc.policy_area or "").lower()
+
+    # Substring / Exact match boosts using prompt_text
+    if prompt_text and prompt_text.strip():
+        p_clean = prompt_text.lower().strip()
+        if p_clean in title_lower:
+            score += 100
+        elif any(part in title_lower for part in p_clean.split() if len(part) > 3):
+            score += 40
+
+    topic_hits = len(topic_set & doc_topics)
+    score += min(topic_hits * 40, 80)
+    subject_hits = sum(1 for kw in keywords if any(kw in subj for subj in doc_subjects))
+    score += min(subject_hits * 20, 40)
+    if any(kw in policy_lower for kw in keywords) or policy_lower in {t.lower() for t in topics}:
+        score += 15
+    title_hits = sum(1 for kw in keywords if kw in title_lower)
+    score += min(title_hits * 5, 15)
+    summary_hits = sum(1 for kw in keywords if kw in summary_lower)
+    score += min(summary_hits * 3, 6)
+
+    return min(round(score / 156 * 100), 100)
+
+
+def process_bill_ai(document: LegislativeDocument, db: Optional[Session] = None) -> None:
+    """Run the AI relevance-scoring and impact-summary pipeline on a document.
+
+    Sends the bill's title, policy area, subjects, latest action, and official summary
+    to the configured LLM (via OpenRouter) and stores the structured result on the
+    document (``relevance_score``, ``relevance_topics``, ``relevance_rationale``,
+    ``ai_summary``, ``ai_generated_at``, ``ai_source_hash``).
+
+    Skips work when AI output already exists for the current ``source_hash`` so the
+    pipeline only regenerates when the underlying bill content changed. Persists via
+    ``db.commit()`` when a session is provided. Failures are logged and swallowed so a
+    single bad bill never breaks the surrounding sync.
+    """
+    source_id = getattr(document, "source_id", "unknown")
+    try:
+        # Always fetch official summary if missing but available from Congress.gov.
+        # Do this before the skip check so we persist the summary even on skips,
+        # and so the AI gets it when the bill was synced before summary-fetching was added.
+        summary_just_fetched = False
+        if not document.official_summary:
+            api_raw = document.api_raw or {}
+            summaries_meta = api_raw.get("summaries") or {}
+            if summaries_meta.get("count", 0):
+                try:
+                    client = CongressAPIClient()
+                    data = client.fetch_bill_summaries(document.congress, document.bill_type, document.bill_number)
+                    client.close()
+                    summaries_list = data.get("summaries", [])
+                    if summaries_list:
+                        raw_text = summaries_list[-1].get("text") or ""
+                        fetched = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", raw_text)).strip() or None
+                        if fetched:
+                            document.official_summary = fetched
+                            summary_just_fetched = True
+                            logger.info(f"Fetched missing official_summary for {source_id}.")
+                except Exception as fetch_err:
+                    logger.warning(f"Could not fetch summary for {source_id}: {fetch_err}")
+
+        # Skip AI only when hash is current AND we didn't just obtain a new summary
+        # (a newly fetched summary means the previous AI run lacked this context).
+        already_current = (
+            document.ai_source_hash
+            and document.ai_source_hash == document.source_hash
+            and document.ai_generated_at is not None
+        )
+        if already_current and not summary_just_fetched:
+            if summary_just_fetched and db is not None:
+                db.commit()  # persist the summary even if AI is skipped
+            logger.info(f"AI output for {source_id} is current (hash unchanged); skipping.")
+            return
+
+        logger.info(f"Running AI pipeline for {source_id} using model {settings.LLM_MODEL}.")
+        user_prompt = _build_user_prompt(document)
+        raw = _call_llm(user_prompt)
+        score, topics, rationale, summary = _normalize_output(raw)
+
+        document.relevance_score = score
+        document.relevance_topics = topics
+        document.relevance_rationale = rationale
+        document.ai_summary = summary
+        document.ai_generated_at = datetime.now()
+        document.ai_source_hash = document.source_hash
+
+        if db is not None:
+            db.commit()
+
+        logger.info(f"AI pipeline complete for {source_id}: score={score}, topics={topics}.")
+    except Exception as e:
+        if db is not None:
+            db.rollback()
+        logger.exception(f"Failed to process bill {source_id} with AI: {e}")
