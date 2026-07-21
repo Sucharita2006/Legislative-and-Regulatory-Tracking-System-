@@ -1128,10 +1128,10 @@ async def send_test_digest(
     Generate and send a test digest email immediately to the specified email address.
     """
     profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
-    if not profile or not profile.is_admin:
+    if not profile:
         raise HTTPException(
-            status_code=403,
-            detail="Forbidden: Only administrators can trigger test digests."
+            status_code=404,
+            detail=f"User {email} not found."
         )
 
     from .services.digest_service import compile_single_digest
