@@ -9,7 +9,6 @@ from typing import Dict, Any, List, Optional
 import csv
 import os
 import re
-from apscheduler.schedulers.background import BackgroundScheduler
 from .services.daily_sync import process_daily_sync
 from .database import SessionLocal
 import io
@@ -63,11 +62,7 @@ def startup_event():
             print(f"Startup: Marked {len(stuck)} interrupted sync log(s).")
     finally:
         db.close()
-    # Start APScheduler for daily sync at midnight UTC
-    import pytz
-    scheduler = BackgroundScheduler(timezone=pytz.utc)
-    scheduler.add_job(process_daily_sync, "cron", hour=0, minute=0)
-    scheduler.start()
+
 
 
 def extract_sponsor_info(api_raw: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:

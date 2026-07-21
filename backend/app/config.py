@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     LLM_MODEL: str = Field(
         
-        default="anthropic/claude-sonnet-4.5",
+        default="google/gemini-3.1-flash-lite",
         validation_alias=AliasChoices("LLM_MODEL", "OPENROUTER_MODEL"),
     )
 
