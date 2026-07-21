@@ -1,5 +1,7 @@
 import { redirect } from "next/navigation";
 import Link from "next/link";
+
+export const dynamic = "force-dynamic";
 import { createClient } from "@/lib/supabase/server";
 import { Container } from "@/components/ui";
 import { getAccessProfile } from "@/lib/auth";

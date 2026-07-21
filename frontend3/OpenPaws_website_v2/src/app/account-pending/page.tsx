@@ -1,5 +1,7 @@
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
+
+export const dynamic = "force-dynamic";
 import { Container, Heading, SectionLabel, Button, ButtonLink } from "@/components/ui";
 import { createClient } from "@/lib/supabase/server";
 import { isApproved } from "@/lib/auth";
