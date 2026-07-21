@@ -1,0 +1,228 @@
+@import "tailwindcss";
+
+/* Dark mode is driven by a `.dark` class on <html>, not the OS media query,
+   so the in-app toggle can override the system preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+  OpenPaws.ai design system — from the official Brand Identity guide.
+  Philosophy: "white space, black clarity, teal confidence, and a single
+  warm accent only when the message earns it."
+
+  Theming model
+  -------------
+  The site was originally built dark-first, with `text-white` / `bg-black` /
+  `border-white/10` hard-coded everywhere. To support a light/dark toggle
+  without rewriting every utility, `--color-white` and `--color-black` are
+  redefined as *semantic* tokens that flip per theme:
+
+    • "white" = ink / foreground   (light text on dark, dark text on light)
+    • "black" = page / background  (the surface those sit on)
+
+  In dark mode they keep their literal meaning. In light mode they invert, so
+  every existing `text-white`, `bg-black`, and `white/10` opacity utility
+  follows the active theme automatically. Brand accents (teal, coral, gold,
+  peach) are theme-independent and keep their fixed values. Anything that must
+  stay a true light color on a teal fill uses `--color-on-teal`.
+*/
+
+@theme {
+  /* Brand accents — constant across themes */
+  --color-teal: #006c67; /* primary accent: CTA, links, active, dividers, logo */
+  --color-grey: #888888; /* secondary text */
+  --color-coral: #ff8552; /* campaign highlights, alerts, urgency */
+  --color-gold: #d19900; /* badges, awards, data highlights */
+  --color-peach: #ffe1d1; /* callouts, quotes, testimonials */
+
+  /* Always-light text for use on teal fills (button labels, etc.) */
+  --color-on-teal: #ffffff;
+
+  /* Semantic ink/page tokens — wired to per-theme variables below.
+     Redefining `white`/`black` here means all existing utilities
+     (text-white, bg-black, border-white/10, bg-white/[0.02], …) become
+     theme-aware with no markup changes. */
+  --color-white: var(--ink);
+  --color-black: var(--page);
+
+  /* Fonts (wired to next/font CSS variables in layout.tsx) */
+  --font-display: var(--font-dm-serif), Georgia, serif;
+  --font-sans: var(--font-space-grotesk), system-ui, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, monospace;
+}
+
+/* Default theme is LIGHT: white page, near-black ink, teal accents. */
+:root {
+  --page: #ffffff;
+  --ink: #0a0a0a;
+  --background: var(--page);
+  --foreground: var(--ink);
+}
+
+/* Dark theme: black page, white ink. */
+.dark {
+  --page: #000000;
+  --ink: #ffffff;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  font-weight: 300;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+::selection {
+  background: var(--color-teal);
+  color: var(--color-on-teal);
+}
+
+/*
+  Film-grain overlay — "expired 35mm stock: tactile, imperfect, warm".
+  Apply `.grain` to a relatively-positioned container.
+  Subtler in light mode so it doesn't muddy the white page.
+*/
+.grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  opacity: 0.04;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 200px 200px;
+}
+.dark .grain::after {
+  opacity: 0.09;
+}
+
+/* Article body styling for the Knowledge Base (rendered markdown). */
+.prose-paws {
+  font-family: var(--font-sans);
+  font-weight: 300;
+  line-height: 1.75;
+  color: color-mix(in srgb, var(--foreground) 85%, transparent);
+}
+.prose-paws h2,
+.prose-paws h3 {
+  font-family: var(--font-display);
+  color: var(--foreground);
+  font-weight: 400;
+  margin-top: 2.5rem;
+  margin-bottom: 1rem;
+  line-height: 1.15;
+}
+.prose-paws h2 {
+  font-size: 1.875rem;
+}
+.prose-paws h3 {
+  font-size: 1.375rem;
+}
+.prose-paws p {
+  margin-bottom: 1.25rem;
+}
+.prose-paws a {
+  color: var(--color-teal);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.prose-paws ul,
+.prose-paws ol {
+  margin: 1.25rem 0;
+  padding-left: 1.5rem;
+  list-style: disc;
+}
+.prose-paws ol {
+  list-style: decimal;
+}
+.prose-paws li {
+  margin-bottom: 0.5rem;
+}
+.prose-paws blockquote {
+  border-left: 3px solid var(--color-teal);
+  padding-left: 1.25rem;
+  margin: 1.5rem 0;
+  color: color-mix(in srgb, var(--foreground) 70%, transparent);
+  font-style: italic;
+}
+.prose-paws code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: color-mix(in srgb, var(--foreground) 8%, transparent);
+  padding: 0.15em 0.4em;
+  border-radius: 3px;
+}
+.prose-paws pre {
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+  border: 1px solid color-mix(in srgb, var(--foreground) 10%, transparent);
+  padding: 1rem 1.25rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  margin: 1.5rem 0;
+}
+.prose-paws pre code {
+  background: none;
+  padding: 0;
+}
+
+/* GFM tables */
+.prose-paws table {
+  width: 100%;
+  margin: 1.5rem 0;
+  border-collapse: collapse;
+  font-size: 0.9375rem;
+  display: block;
+  overflow-x: auto;
+}
+.prose-paws thead {
+  border-bottom: 2px solid var(--color-teal);
+}
+.prose-paws th,
+.prose-paws td {
+  padding: 0.625rem 0.875rem;
+  text-align: left;
+  vertical-align: top;
+  border: 1px solid color-mix(in srgb, var(--foreground) 12%, transparent);
+}
+.prose-paws th {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  color: var(--foreground);
+  background: color-mix(in srgb, var(--foreground) 5%, transparent);
+}
+.prose-paws tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--foreground) 3%, transparent);
+}
+
+/* Tighter spacing for prose rendered inside a chat bubble. */
+.prose-paws-chat > :first-child {
+  margin-top: 0;
+}
+.prose-paws-chat > :last-child {
+  margin-bottom: 0;
+}
+.prose-paws-chat h2,
+.prose-paws-chat h3 {
+  margin-top: 1.25rem;
+}
+.prose-paws-chat h2 {
+  font-size: 1.375rem;
+}
+.prose-paws-chat h3 {
+  font-size: 1.125rem;
+}
+.prose-paws-chat p {
+  margin-bottom: 0.75rem;
+}
+.prose-paws-chat table {
+  margin: 1rem 0;
+}
