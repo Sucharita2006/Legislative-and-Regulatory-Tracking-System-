@@ -112,7 +112,7 @@ def _call_llm(user_prompt: str) -> Dict[str, Any]:
         "X-Title": "AnimalLegislationTracker",
     }
     # Try the primary model first, then any fallbacks configured in settings.
-    models_to_try = [settings.LLM_MODEL] + list(getattr(settings, "FALLBACK_LLM_MODELS", []) or [])
+    models_to_try = [settings.SCANNING_LLM_MODEL] + list(getattr(settings, "FALLBACK_LLM_MODELS", []) or [])
     last_exc: Optional[Exception] = None
 
     for idx, model_name in enumerate(models_to_try):
@@ -307,7 +307,7 @@ def expand_prompt_to_topics(user_prompt: str, db: Optional[Session] = None, user
         f'  "inferred_filters": a JSON object containing the keys "subject", "origin_chamber", "bill_type", "date_from", "date_to", and "state" with their inferred values.'
     )
     payload = {
-        "model": settings.LLM_MODEL,
+        "model": settings.SCANNING_LLM_MODEL,
         "messages": [
             {"role": "system", "content": "You map user tracking preferences to structured topic lists and infer filters. Always respond with a single JSON object and nothing else."},
             {"role": "user", "content": expansion_prompt},
@@ -488,7 +488,7 @@ def process_bill_ai(document: LegislativeDocument, db: Optional[Session] = None)
             logger.info(f"AI output for {source_id} is current (hash unchanged); skipping.")
             return
 
-        logger.info(f"Running AI pipeline for {source_id} using model {settings.LLM_MODEL}.")
+        logger.info(f"Running AI pipeline for {source_id} using model {settings.SCANNING_LLM_MODEL}.")
         user_prompt = _build_user_prompt(document)
         raw = _call_llm(user_prompt)
         score, topics, rationale, summary = _normalize_output(raw)

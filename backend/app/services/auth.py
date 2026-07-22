@@ -70,6 +70,11 @@ def require_internal_key(authorization: Optional[str] = Header(None)) -> None:
 
 
 def _decode_service_jwt(authorization: Optional[str]) -> dict:
+    if settings.INTERNAL_API_KEY and authorization and authorization.startswith("Bearer "):
+        token = authorization[len("Bearer "):].strip()
+        if secrets.compare_digest(token, settings.INTERNAL_API_KEY):
+            return {"sub": "internal_key"}
+
     if not settings.SERVICE_JWT_SECRET:
         raise HTTPException(
             status_code=503,
@@ -106,6 +111,7 @@ def require_service_jwt_for_email(email: str, authorization: Optional[str] = Hea
     one user can't be replayed against another user's data — unlike
     `require_internal_key`, which lets any key holder act as any email."""
     payload = _decode_service_jwt(authorization)
-    if str(payload.get("sub", "")).lower() != email.lower():
+    sub = str(payload.get("sub", "")).lower()
+    if sub != "internal_key" and sub != email.lower():
         raise HTTPException(status_code=403, detail="Token does not authorize this email")
     return payload

@@ -182,6 +182,42 @@ def _compile_user_digest_items(
     return items, is_fallback_active
 
 
+import httpx
+
+def _generate_digest_overall_summary(items: List[Dict[str, Any]]) -> Optional[str]:
+    """Generate an overall summary for an email digest using DIGEST_LLM_MODEL (Claude Opus)."""
+    if not items or not settings.OPENROUTER_API_KEY:
+        return None
+    url = f"{settings.OPENROUTER_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {settings.OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": "AnimalLegislationTracker",
+    }
+    bullets = "\n".join([f"- {i['title']} ({i['policy_area']}): {i['ai_summary']}" for i in items[:10]])
+    prompt = (
+        "Synthesize a concise 2-3 sentence executive summary for an email legislative briefing "
+        f"covering these updates:\n\n{bullets}"
+    )
+    payload = {
+        "model": settings.DIGEST_LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": "You provide executive summaries of legislative updates. Be concise and factual."},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0.3,
+    }
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"]
+            return content.strip() if content else None
+    except Exception as e:
+        logger.warning("Failed to generate digest overall summary: %s", e)
+        return None
+
+
 def _finalize_digest_payload(
     user: UserProfile,
     frequency: str,
@@ -224,6 +260,8 @@ def _finalize_digest_payload(
     if watched_group["items"]:
         prompt_groups.append(watched_group)
 
+    overall_summary = _generate_digest_overall_summary(final_items)
+
     return {
         "recipient": {
             "user_id": str(user.id),
@@ -238,7 +276,7 @@ def _finalize_digest_payload(
             "total_items": len(final_items),
             "max_items_limit": settings.DIGEST_MAX_ITEMS,
         },
-        "overall_summary": None,
+        "overall_summary": overall_summary,
         "items": final_items,
         "prompt_groups": prompt_groups,
         "is_fallback_active": is_fallback_active,

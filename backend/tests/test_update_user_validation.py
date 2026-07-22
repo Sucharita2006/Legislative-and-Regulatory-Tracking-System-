@@ -52,8 +52,10 @@ class TestUpdateUserReviewBillsValidation(unittest.TestCase):
         self.mock_db = MagicMock()
         self.profile = FakeProfile()
         self.mock_db.query.return_value.filter.return_value.first.return_value = self.profile
+        from backend.app.services.auth import require_service_jwt_for_email
         app.dependency_overrides[get_db] = lambda: self.mock_db
         app.dependency_overrides[require_internal_key] = lambda: None
+        app.dependency_overrides[require_service_jwt_for_email] = lambda: {"sub": "user@example.com"}
 
     def tearDown(self):
         app.dependency_overrides.clear()
