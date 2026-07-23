@@ -221,3 +221,29 @@ class BillTag(Base):
         UniqueConstraint("user_id", "document_id", "tag_name", name="uq_bill_tags_user_document_tag"),
     )
 
+
+class DigestLog(Base):
+    """Records each digest email sent (or failed) so users can see delivery history."""
+    __tablename__ = "digest_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user_profiles.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    prompt_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user_prompts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    frequency: Mapped[str] = mapped_column(String(20), nullable=False)  # 'daily' | 'weekly'
+    status: Mapped[str] = mapped_column(String(20), nullable=False)     # 'sent' | 'failed'
+    items_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), index=True)
+
+    user: Mapped["UserProfile"] = relationship("UserProfile")
+    prompt: Mapped[Optional["UserPrompt"]] = relationship("UserPrompt")
+

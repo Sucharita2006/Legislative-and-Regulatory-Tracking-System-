@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { TOPIC_CATEGORIES } from "@/lib/legislative-topics";
 import type { UserProfile, UserPrompt } from "./types";
 
@@ -13,6 +13,18 @@ const SCOPE_LABELS: Record<string, string> = {
 export function PreferencesTab({ user: initialUser }: { user: UserProfile }) {
   const [user, setUser] = useState<UserProfile>(initialUser);
   const [testRunStatus, setTestRunStatus] = useState<Record<string, string>>({});
+  const [digestHistory, setDigestHistory] = useState<any[]>([]);
+
+  useEffect(() => {
+    fetch(`/api/user?path=${encodeURIComponent(`/users/${encodeURIComponent(initialUser.email)}/digest-history`)}`)
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.logs) {
+          setDigestHistory(data.logs);
+        }
+      })
+      .catch(console.error);
+  }, [initialUser.email]);
 
   // Prompt modal state
   const [modalOpen, setModalOpen] = useState(false);
@@ -145,7 +157,9 @@ export function PreferencesTab({ user: initialUser }: { user: UserProfile }) {
         </p>
 
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
-          {user.prompts.map(p => (
+          {user.prompts.map(p => {
+            const lastLog = digestHistory.find(log => log.prompt_id === p.id);
+            return (
             <div
               key={p.id}
               className="flex flex-col justify-between rounded-2xl border border-white/10 bg-white/[0.02] p-5"
@@ -162,6 +176,25 @@ export function PreferencesTab({ user: initialUser }: { user: UserProfile }) {
                   </span>
                 </div>
                 <p className="mt-2 text-sm text-white/70 leading-relaxed">{p.prompt_text}</p>
+                
+                {/* Digest History Row */}
+                <div className="mt-4 border-t border-white/10 pt-3">
+                  {lastLog ? (
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className={lastLog.status === "sent" ? "text-teal" : "text-coral"}>
+                        {lastLog.status === "sent" ? "✓ Sent" : "✕ Failed"}
+                      </span>
+                      <span className="text-white/40">•</span>
+                      <span className="text-white/60">
+                        {new Date(lastLog.sent_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })} at {new Date(lastLog.sent_at).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}
+                      </span>
+                      <span className="text-white/40">•</span>
+                      <span className="text-white/50">{lastLog.items_count} bill{lastLog.items_count !== 1 ? 's' : ''}</span>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-white/30 italic">Never sent</div>
+                  )}
+                </div>
               </div>
               <div className="mt-4 flex flex-wrap gap-2">
                 <button
@@ -202,7 +235,7 @@ export function PreferencesTab({ user: initialUser }: { user: UserProfile }) {
                 )}
               </div>
             </div>
-          ))}
+          )})}
 
           <button
             type="button"

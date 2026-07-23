@@ -16,7 +16,7 @@ import json
 from datetime import date
 
 from .database import get_db
-from .models import LegislativeDocument, SyncLog, Base, Subject, UserProfile, UserPrompt, BillAction, BillTag
+from .models import LegislativeDocument, SyncLog, Base, Subject, UserProfile, UserPrompt, BillAction, BillTag, DigestLog
 from .services.sync import seed_animal_subjects, run_historical_backfill
 from .services.matching import get_current_stage, SUBJECT_CATEGORIES
 from .services.ai_processing import process_bill_ai, expand_prompt_to_topics, score_against_prompt
@@ -1070,18 +1070,50 @@ async def _bg_send_digests(frequency: str):
     from .services.digest_service import compile_digests
     from .services.email_render_service import render_digest_html
     from .services.email_delivery_service import send_html_email
-    
+    import logging
+    logger = logging.getLogger(__name__)
+
     db = SessionLocal()
     try:
         payloads = compile_digests(db, frequency)
         for payload in payloads:
             recipient_email = payload["recipient"]["email"]
+            user_id = payload["recipient"].get("user_id")
+            items_count = payload["digest_metadata"].get("total_items", 0)
+            # Collect prompt IDs covered by this digest
+            prompt_ids = set()
+            for item in payload.get("items", []):
+                pid = item.get("matched_prompt_id")
+                if pid and pid != "watched":
+                    prompt_ids.add(pid)
+
             try:
                 html_content = render_digest_html(payload)
                 subject = f"ALDF {frequency.capitalize()} Digest — {payload['digest_metadata']['generated_at'][:10]}"
                 await send_html_email(recipient_email, subject, html_content)
+
+                # Log a successful send for each prompt covered
+                if prompt_ids and user_id:
+                    for pid in prompt_ids:
+                        db.add(DigestLog(
+                            user_id=user_id, prompt_id=pid, frequency=frequency,
+                            status="sent", items_count=items_count,
+                        ))
+                elif user_id:
+                    db.add(DigestLog(
+                        user_id=user_id, prompt_id=None, frequency=frequency,
+                        status="sent", items_count=items_count,
+                    ))
+                db.commit()
             except Exception as e:
-                print(f"Error sending {frequency} digest to {recipient_email}: {e}")
+                logger.exception("Error sending %s digest to %s: %s", frequency, recipient_email, e)
+                if user_id:
+                    db.add(DigestLog(
+                        user_id=user_id, prompt_id=None, frequency=frequency,
+                        status="failed", items_count=0,
+                        error_message=str(e)[:500],
+                    ))
+                    db.commit()
     finally:
         db.close()
         release_lock(f"digest_{frequency}")
@@ -1151,8 +1183,37 @@ async def send_test_digest(
             html_content = render_digest_html(payload)
             subject = f"ALDF Test {frequency.capitalize()} Briefing"
             await send_html_email(email, subject, html_content)
+            
+            items_count = payload.get("digest_metadata", {}).get("total_items", 0)
+            
+            # Find which prompts this digest covers
+            prompt_ids = set()
+            for item in payload.get("items", []):
+                pid = item.get("matched_prompt_id")
+                if pid and pid != "watched":
+                    prompt_ids.add(pid)
+                    
+            if prompt_ids:
+                for pid in prompt_ids:
+                    db.add(DigestLog(
+                        user_id=profile.id, prompt_id=pid, frequency=frequency,
+                        status="sent", items_count=items_count,
+                    ))
+            else:
+                # E.g., if there were no bills, or it only matched watched bills
+                db.add(DigestLog(
+                    user_id=profile.id, prompt_id=prompt_id, frequency=frequency,
+                    status="sent", items_count=items_count,
+                ))
+            db.commit()
+
             return {"message": f"Test email sent successfully to {email}."}
         except Exception as e:
+            db.add(DigestLog(
+                user_id=profile.id, prompt_id=prompt_id, frequency=frequency,
+                status="failed", items_count=0, error_message=str(e)[:500]
+            ))
+            db.commit()
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to send test email: {str(e)}"
@@ -1369,6 +1430,40 @@ def update_user(
     except Exception as e:
         pass
     return _format_profile(profile)
+
+
+@app.get("/users/{email}/digest-history")
+def get_user_digest_history(
+    email: str,
+    db: Session = Depends(get_db),
+    _auth: dict = Depends(require_service_jwt_for_email),
+):
+    """Fetch recent digest log entries for a user, grouped/ordered by prompt."""
+    profile = db.query(UserProfile).filter(func.lower(UserProfile.email) == email.lower()).first()
+    if not profile:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Fetch latest 20 logs for this user, newest first
+    logs = db.query(DigestLog)\
+        .filter(DigestLog.user_id == profile.id)\
+        .order_by(DigestLog.sent_at.desc())\
+        .limit(20)\
+        .all()
+        
+    return {
+        "logs": [
+            {
+                "id": str(log.id),
+                "prompt_id": str(log.prompt_id) if log.prompt_id else None,
+                "frequency": log.frequency,
+                "status": log.status,
+                "items_count": log.items_count,
+                "error_message": log.error_message,
+                "sent_at": log.sent_at.isoformat() if log.sent_at else None,
+            }
+            for log in logs
+        ]
+    }
 
 
 def _format_profile(profile: UserProfile) -> Dict[str, Any]:
