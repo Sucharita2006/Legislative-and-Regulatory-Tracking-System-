@@ -8,17 +8,29 @@ class Settings(BaseSettings):
     CONGRESS_API_KEY: str
     DATABASE_URL: str
 
-    # OpenRouter (OpenAI-compatible) settings for the AI processing pipeline.
+    # OpenRouter (OpenAI-compatible) settings for AI processing pipelines.
     OPENROUTER_API_KEY: str
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
-    LLM_MODEL: str = Field(
-        
-        default="google/gemini-3.1-flash-lite",
-        validation_alias=AliasChoices("LLM_MODEL", "OPENROUTER_MODEL"),
+
+    # Scanning pipeline LLM (Gemini via OpenRouter)
+    SCANNING_LLM_MODEL: str = Field(
+        default="google/gemini-2.5-flash",
+        validation_alias=AliasChoices("SCANNING_LLM_MODEL", "LLM_MODEL", "OPENROUTER_MODEL"),
     )
 
+    # Email Digest generation LLM (Claude Opus via OpenRouter)
+    DIGEST_LLM_MODEL: str = Field(
+        default="anthropic/claude-3-opus",
+        validation_alias=AliasChoices("DIGEST_LLM_MODEL"),
+    )
+
+    # Alias for backward compatibility
+    @property
+    def LLM_MODEL(self) -> str:
+        return self.SCANNING_LLM_MODEL
+
     # Optional list of fallback model names (tried in order) if the primary
-    # `LLM_MODEL` fails (e.g. provider/model EOL). To avoid strict JSON parsing
+    # `SCANNING_LLM_MODEL` fails (e.g. provider/model EOL). To avoid strict JSON parsing
     # failures from empty/Railway values, accept a raw string in the env and
     # normalize it after Settings is created. The env can be either a JSON
     # array like '["gpt-4o-mini"]' or a comma-separated string 'gpt-4o-mini,gpt-4o'.

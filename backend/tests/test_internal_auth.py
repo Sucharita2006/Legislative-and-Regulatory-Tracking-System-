@@ -71,6 +71,7 @@ class TestInternalAuth(unittest.TestCase):
         resource is a common place to add a new route and forget the
         dependency, so cover more than one endpoint."""
         settings.INTERNAL_API_KEY = "correct-key"
+        settings.SERVICE_JWT_SECRET = "dummy"
         protected_calls = [
             ("GET", "/users/someone@example.com"),
             ("GET", "/users/someone@example.com/prompts"),
