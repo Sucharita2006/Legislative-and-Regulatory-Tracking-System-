@@ -69,9 +69,8 @@ class Settings(BaseSettings):
     DIGEST_WINDOW_DAILY_HOURS: int = 24
     DIGEST_WINDOW_WEEKLY_DAYS: int = 7
 
-    # Frontend base URLs (used in post-verification redirects)
+    # Frontend base URL (used in post-verification redirects)
     FRONTEND_URL: str = "http://localhost:5173"
-    FRONTEND3_URL: str = "http://localhost:3000"
 
     # Rate limiting for AI-costing search endpoints (per identity per minute).
     RATE_LIMIT_SEARCH_PER_MINUTE: int = 20
