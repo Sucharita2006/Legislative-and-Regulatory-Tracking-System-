@@ -157,7 +157,7 @@ def _score_candidate_docs(
         else:
             explanation = _extract_matching_snippet(doc, best_prompt)
 
-        app_detail_url = f"{settings.FRONTEND_URL.rstrip('/')}/documents/{doc.source_id}"
+        app_detail_url = f"{settings.FRONTEND_URL.rstrip('/')}/?bill={doc.source_id}"
         external_source_url = doc.source_url or f"https://www.congress.gov/bill/{doc.congress}th-congress/none"
 
         items.append({

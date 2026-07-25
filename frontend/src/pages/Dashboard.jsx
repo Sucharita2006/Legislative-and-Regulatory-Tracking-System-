@@ -495,6 +495,16 @@ export default function Dashboard({ onLogout, theme, toggleTheme, userEmail }) {
       setModalDetailsLoading(false);
     }
   };
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const billId = params.get('bill');
+    if (billId) {
+      handleBillClick({ source_id: billId });
+      window.history.replaceState({}, '', window.location.pathname);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   
   const runAiAnalysis = async () => {
     setAiLoading(true);
