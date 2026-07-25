@@ -1,6 +1,7 @@
 from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, Optional, Callable, Tuple
 import logging
+import re
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import or_
 
@@ -69,6 +70,43 @@ def _build_prompt_embeddings(
     return prompt_embeddings
 
 
+def _extract_matching_snippet(doc: LegislativeDocument, prompt: Optional[Any]) -> str:
+    """Extract a direct quoted sentence snippet from the bill text/summary that best
+    matches the target prompt keywords/topics."""
+    summary = (doc.ai_summary or "").strip()
+    if not summary or summary == "(no AI summary available)":
+        return f'"{doc.title.strip()}"' if doc.title else "Legislative update flagged for your watchlist."
+
+    # Handle common abbreviations like U.S. during sentence splitting
+    clean_text = re.sub(r'\bU\.S\.', 'U_S_', summary)
+    raw_sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z])', clean_text)
+    sentences = [s.replace('U_S_', 'U.S.').strip() for s in raw_sentences if len(s.strip()) > 10]
+    if not sentences:
+        return f'"{summary}"'
+
+    # Gather target keywords & topics
+    exp = (prompt.expanded_topics or {}) if prompt and hasattr(prompt, "expanded_topics") else {}
+    keywords = [k.lower() for k in (exp.get("keywords", []) + exp.get("topics", [])) if k]
+    if not keywords and prompt and getattr(prompt, "prompt_text", None):
+        keywords = [w.lower() for w in prompt.prompt_text.split() if len(w) > 3]
+
+    best_sentence = sentences[0]
+    best_score = -1
+
+    for sentence in sentences:
+        s_lower = sentence.lower()
+        score = sum(1 for kw in keywords if re.search(r'\b' + re.escape(kw) + r'\b', s_lower))
+        if score > best_score and score > 0:
+            best_score = score
+            best_sentence = sentence
+
+    clean_snippet = best_sentence.strip()
+    if len(clean_snippet) > 180:
+        clean_snippet = clean_snippet[:177].rstrip() + "..."
+
+    return f'"{clean_snippet}"'
+
+
 def _score_candidate_docs(
     candidate_docs: List[LegislativeDocument],
     matching_prompts: List[Any],
@@ -117,7 +155,7 @@ def _score_candidate_docs(
             best_score = doc.relevance_score or 50
             explanation = "Manually added to your watchlist"
         else:
-            explanation = f"Semantic relevance score: {best_score}/100"
+            explanation = _extract_matching_snippet(doc, best_prompt)
 
         app_detail_url = f"{settings.FRONTEND_URL.rstrip('/')}/documents/{doc.source_id}"
         external_source_url = doc.source_url or f"https://www.congress.gov/bill/{doc.congress}th-congress/none"

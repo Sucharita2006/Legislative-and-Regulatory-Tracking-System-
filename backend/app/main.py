@@ -2154,7 +2154,7 @@ def auth_verify(token: str, origin: str = "frontend", db: Session = Depends(get_
     from fastapi.responses import RedirectResponse
     from .config import settings as cfg
 
-    print(f"[auth/verify] origin={origin!r} FRONTEND_URL={cfg.FRONTEND_URL!r} FRONTEND3_URL={cfg.FRONTEND3_URL!r}")
+    print(f"[auth/verify] FRONTEND_URL={cfg.FRONTEND_URL!r}")
 
     profile = db.query(UserProfile).filter(UserProfile.verification_token == token).first()
     if not profile:
@@ -2164,7 +2164,7 @@ def auth_verify(token: str, origin: str = "frontend", db: Session = Depends(get_
     profile.verification_token = None
     db.commit()
 
-    base_url = (cfg.FRONTEND3_URL if origin == "frontend3" else cfg.FRONTEND_URL).rstrip("/")
+    base_url = cfg.FRONTEND_URL.rstrip("/")
     print(f"[auth/verify] redirecting to {base_url}?verified=true")
     return RedirectResponse(url=f"{base_url}?verified=true")
 
